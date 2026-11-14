@@ -279,6 +279,14 @@ class TaskResultIn(BaseModel):
 class TaskCheckpointIn(BaseModel):
     checkpoint: dict = Field(default_factory=dict)
 
+class ProjectMemoryIn(BaseModel):
+    tenant: str = Field(default="default", min_length=1, max_length=100)
+    title: str = Field(min_length=1, max_length=200)
+    content: str = Field(min_length=1, max_length=20_000)
+    source: str = Field(min_length=1, max_length=500)
+    source_task_id: str | None = Field(default=None, max_length=64)
+    retention_days: int = Field(default=180, ge=1, le=365)
+
 class LoginIn(BaseModel):
     username: str
     password: str
@@ -1676,6 +1684,76 @@ def create_app(*, admin_token: str | None = None, db_path: Path | None = None, d
                 cur = conn.execute("DELETE FROM tasks WHERE status IN ('completed', 'failed', 'cancelled', 'timed_out')")
         audit(actor, "", "clear_tasks", {"status": status or "finished", "deleted_count": cur.rowcount}, "allowed")
         return {"deleted_count": cur.rowcount}
+
+    @app.post("/api/projects/{project_id}/memory")
+    def add_project_memory(
+        project_id: str,
+        body: ProjectMemoryIn,
+        x_admin_token: str | None = Header(default=None),
+        x_session_token: str | None = Header(default=None),
+    ):
+        actor = require_role("operator", x_admin_token, x_session_token)
+        project_id = project_id.strip()
+        if not project_id or len(project_id) > 200:
+            raise HTTPException(status_code=422, detail="project_id must be 1–200 characters.")
+        if body.source_task_id:
+            task = conn.execute(
+                "SELECT id FROM tasks WHERE id=? AND tenant=?",
+                (body.source_task_id, body.tenant),
+            ).fetchone()
+            if task is None:
+                raise HTTPException(status_code=404, detail="Source task was not found in this tenant.")
+        memory_id = uuid.uuid4().hex[:16]
+        now = dbmod.now()
+        title = redact(body.title.strip())[:200]
+        content = redact(body.content.strip())
+        source = redact(body.source.strip())[:500]
+        expires_at = now + body.retention_days * 86400
+        conn.execute(
+            "INSERT INTO project_memories (id, tenant, project_id, title, content, source, source_task_id, created_by, created_at, expires_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (memory_id, body.tenant, project_id, title, content, source, body.source_task_id, actor, now, expires_at),
+        )
+        conn.commit()
+        audit(actor, "", "add_project_memory", {"memory_id": memory_id, "project_id": project_id, "source_task_id": body.source_task_id}, "allowed", tenant=body.tenant)
+        return {"id": memory_id, "tenant": body.tenant, "project_id": project_id, "title": title, "content": content, "source": source, "source_task_id": body.source_task_id, "created_by": actor, "created_at": now, "expires_at": expires_at}
+
+    @app.get("/api/projects/{project_id}/memory")
+    def list_project_memory(
+        project_id: str,
+        tenant: str = "default",
+        limit: int = 50,
+        x_admin_token: str | None = Header(default=None),
+        x_session_token: str | None = Header(default=None),
+    ):
+        require_role("viewer", x_admin_token, x_session_token)
+        limit = min(100, max(1, int(limit)))
+        conn.execute(
+            "DELETE FROM project_memories WHERE tenant=? AND project_id=? AND expires_at IS NOT NULL AND expires_at<=?",
+            (tenant, project_id, dbmod.now()),
+        )
+        conn.commit()
+        rows = conn.execute(
+            "SELECT id, tenant, project_id, title, content, source, source_task_id, created_by, created_at, expires_at "
+            "FROM project_memories WHERE tenant=? AND project_id=? ORDER BY created_at DESC LIMIT ?",
+            (tenant, project_id, limit),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    @app.delete("/api/projects/{project_id}/memory/{memory_id}")
+    def delete_project_memory(
+        project_id: str,
+        memory_id: str,
+        x_admin_token: str | None = Header(default=None),
+        x_session_token: str | None = Header(default=None),
+    ):
+        actor = require_role("admin", x_admin_token, x_session_token)
+        cur = conn.execute("DELETE FROM project_memories WHERE id=? AND project_id=?", (memory_id, project_id))
+        conn.commit()
+        if cur.rowcount != 1:
+            raise HTTPException(status_code=404, detail="Project memory not found.")
+        audit(actor, "", "delete_project_memory", {"memory_id": memory_id, "project_id": project_id}, "allowed")
+        return {"id": memory_id, "deleted": True}
 
     @app.get("/api/approvals")
     def list_approvals(x_admin_token: str | None = Header(default=None), x_session_token: str | None = Header(default=None)):

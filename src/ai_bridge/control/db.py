@@ -156,6 +156,14 @@ CREATE TABLE IF NOT EXISTS agent_runs (
   response TEXT DEFAULT '',
   steps_json TEXT NOT NULL DEFAULT '[]',
   error TEXT DEFAULT '');
+CREATE TABLE IF NOT EXISTS project_memories (
+  id TEXT PRIMARY KEY, tenant TEXT NOT NULL DEFAULT 'default', project_id TEXT NOT NULL,
+  title TEXT NOT NULL, content TEXT NOT NULL, source TEXT NOT NULL,
+  source_task_id TEXT, created_by TEXT NOT NULL, created_at REAL NOT NULL,
+  expires_at REAL
+);
+CREATE INDEX IF NOT EXISTS idx_project_memories_lookup
+  ON project_memories(tenant, project_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_custom_agents_due ON custom_agents(enabled, next_run_at);
 CREATE INDEX IF NOT EXISTS idx_agent_runs_agent ON agent_runs(agent_id, started_at DESC);
 CREATE TABLE IF NOT EXISTS workflow_templates (

@@ -35,3 +35,7 @@
   retrying. Queued tasks remain queued and will be available to agents.
 - Heartbeats may report `capabilities` and `inventory`; reports are persisted
   in the device record, capped to 200 capabilities and 32 KB of inventory.
+- Project memory is stored by tenant and project. `POST /api/projects/{id}/memory`
+  accepts a source label, optional same-tenant task evidence, and a retention
+  period of 1–365 days; viewers can list unexpired entries and admins can delete
+  them. Memory content is redacted before storage.
