@@ -437,10 +437,14 @@ def connect(db_path: Path | None = None, database_url: str | None = None) -> Loc
     # 1. PostgreSQL Path
     if db_url and (db_url.startswith("postgres://") or db_url.startswith("postgresql://")):
         conn = PostgresConnection(db_url)
-        from . import migrations
-        migrations.run_migrations(conn, dialect="postgres")
-        from .secret_store import migrate_database_secrets
-        migrate_database_secrets(conn)
+        try:
+            from . import migrations
+            migrations.run_migrations(conn, dialect="postgres")
+            from .secret_store import migrate_database_secrets
+            migrate_database_secrets(conn)
+        except Exception:
+            conn.close()
+            raise
         return conn
 
     # 2. SQLite Path
@@ -459,10 +463,14 @@ def connect(db_path: Path | None = None, database_url: str | None = None) -> Loc
     raw.executescript(SCHEMA)
 
     locked_conn = LockedConnection(raw)
-    from . import migrations
-    migrations.run_migrations(locked_conn, dialect="sqlite")
-    from .secret_store import migrate_database_secrets
-    migrate_database_secrets(locked_conn)
+    try:
+        from . import migrations
+        migrations.run_migrations(locked_conn, dialect="sqlite")
+        from .secret_store import migrate_database_secrets
+        migrate_database_secrets(locked_conn)
+    except Exception:
+        locked_conn.close()
+        raise
     return locked_conn
 
 
