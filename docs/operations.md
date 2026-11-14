@@ -15,10 +15,13 @@
   anonymous IPs on general API paths; authentication flows have separate limits.
   Redis can share limits between processes. Keep proxy-level limiting and
   per-tenant quotas in front of public deployments.
-- The production control API runs one worker because scheduler ownership and
-  several locks remain process-local. Emergency-stop and single-use OIDC state
-  are now database-backed, but emergency-stop changes are not broadcast to
-  concurrently running workers. Do not increase the worker count yet.
+- Scheduled jobs, trigger cooldowns and custom-agent runs use atomic database
+  claims so only one worker claims a due occurrence. The runner loops and other
+  locks remain process-local; a crash after a claim can defer that occurrence
+  until its next interval. Emergency-stop and single-use OIDC state are
+  database-backed, but emergency-stop changes are not broadcast to concurrent
+  workers. Keep the one-worker deployment until these remaining boundaries
+  have shared coordination and recovery tests.
 - PostgreSQL deployments install `requirements-postgres.txt`. Tune
   `AI_BRIDGE_PG_POOL_MIN_SIZE`, `AI_BRIDGE_PG_POOL_MAX_SIZE` and
   `AI_BRIDGE_PG_POOL_WAIT_S` for the deployment; execute the PostgreSQL

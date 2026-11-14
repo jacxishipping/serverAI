@@ -5,8 +5,9 @@
 This document includes implemented components and intended system separation.
 Today the control plane is a Python modular monolith; enrolled agents primarily
 use outbound heartbeat and HTTP long polling, while desktop media uses the
-separate WebRTC signaling and media path below. Background workflow, trigger,
-schedule and custom-agent coordination still contains process-local state.
+separate WebRTC signaling and media path below. Background runner threads and
+several locks remain process-local; due schedule, trigger and custom-agent work
+uses atomic database claims to avoid duplicate execution across workers.
 Emergency-stop and OIDC pending state are database-backed, but emergency-stop
 changes are not propagated between live worker processes. The production
 container therefore runs one API worker; do not raise its worker count until

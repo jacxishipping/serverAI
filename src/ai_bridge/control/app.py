@@ -54,6 +54,30 @@ _DUMMY_SALT = "0" * 32
 _DUMMY_HASH = "0" * 64
 
 
+def _claim_schedule_occurrence(conn: Any, schedule_id: str, now_ts: float, interval_seconds: int) -> bool:
+    cur = conn.execute(
+        "UPDATE schedules SET last_run_at=?, next_run_at=? WHERE id=? "
+        "AND enabled=1 AND next_run_at<=?",
+        (now_ts, now_ts + interval_seconds, schedule_id, now_ts),
+    )
+    claimed = cur.rowcount == 1
+    if not claimed:
+        conn.rollback()
+    return claimed
+
+
+def _claim_trigger_cooldown(conn: Any, trigger_id: str, now_ts: float, cooldown_seconds: int) -> bool:
+    cur = conn.execute(
+        "UPDATE triggers SET last_triggered_at=? WHERE id=? "
+        "AND (last_triggered_at IS NULL OR last_triggered_at<=?)",
+        (now_ts, trigger_id, now_ts - cooldown_seconds),
+    )
+    claimed = cur.rowcount == 1
+    if not claimed:
+        conn.rollback()
+    return claimed
+
+
 def _validate_webhook_url(url: str) -> None:
     if not url:
         return
@@ -2560,7 +2584,8 @@ def create_app(*, admin_token: str | None = None, db_path: Path | None = None, d
                     cooldown = max(10, int(trig["cooldown_seconds"]))
                     last_trig = trig["last_triggered_at"] or 0
                     if (now_ts - last_trig) >= cooldown:
-                        conn.execute("UPDATE triggers SET last_triggered_at=? WHERE id=?", (now_ts, trig["id"]))
+                        if not _claim_trigger_cooldown(conn, str(trig["id"]), now_ts, cooldown):
+                            continue
                         conn.commit()
                         act_type = trig["action_type"]
                         act_target = trig["action_target"]
@@ -2611,8 +2636,8 @@ def create_app(*, admin_token: str | None = None, db_path: Path | None = None, d
                 ).fetchall()
                 for job in due_jobs:
                     interval = max(10, int(job["interval_seconds"]))
-                    next_run = now_ts + interval
-                    conn.execute("UPDATE schedules SET last_run_at=?, next_run_at=? WHERE id=?", (now_ts, next_run, job["id"]))
+                    if not _claim_schedule_occurrence(conn, str(job["id"]), now_ts, interval):
+                        continue
                     conn.commit()
                     tool_name = job["tool"]
                     try:
