@@ -35,8 +35,8 @@
   remain explicitly separate from live operations.
 - Tier-4/device override semantics, tenant isolation and horizontal deployment
   need a dedicated security review. Emergency-stop and single-use OIDC pending
-  state are database-backed and survive restart, but emergency-stop changes are
-  not propagated between live workers. This release is not a security
+  state are database-backed and survive restart. Workers refresh emergency-stop
+  state from the database at most every 500 ms. This release is not a security
   certification.
 - The production container currently uses one API worker because background
   schedulers and several locks remain process-local. PostgreSQL uses a bounded
@@ -44,8 +44,9 @@
   live PostgreSQL service before production rollout.
 - Production Compose requires a Fernet `AI_BRIDGE_DB_ENCRYPTION_KEY` for
   credentials stored in settings and MCP connector records. Back it up outside
-  PostgreSQL and test encrypted backup restore with the same key; automated key
-  rotation and a restore drill remain release work.
+PostgreSQL and test encrypted backup restore with the same key; an operator-run
+key rotation command is available, but rotation and restore drills remain
+release work.
 - Set `AI_BRIDGE_TURN_SECRET` to a high-entropy secret before using TURN REST
   credentials. Without it, ICE configuration is STUN-only.
 - Core navigation/sign-in translations ship as a 20-locale preview with RTL

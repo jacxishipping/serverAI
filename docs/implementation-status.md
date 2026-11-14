@@ -59,10 +59,10 @@ that platform path has been exercised or production-ready.
 - Reverse-proxy mTLS is optional deployment configuration. The control plane
   does not itself terminate client-certificate authentication.
 - Emergency-stop state and single-use OIDC login state are persisted in the
-  database and survive process restarts. The emergency-stop value is loaded at
-  startup; live cross-worker updates are not coordinated. Background schedulers
-  and other locks remain process-local, so use one worker until shared scheduler
-  ownership and multi-worker state propagation are implemented.
+  database and survive process restarts. Workers refresh emergency-stop state
+  from the database at most every 500 ms. Background schedulers, rate limits and
+  other locks remain process-local, so use one worker until shared scheduler
+  ownership and the remaining multi-worker state are coordinated.
 - Browser sessions require distinct bearer tokens for distinct principals.
   Browser egress policy is defense in depth; production deployments handling
   untrusted pages should also restrict outbound network access at the host or
