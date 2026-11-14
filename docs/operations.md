@@ -10,5 +10,28 @@
 - Backups: workspace backups live in `<workspace>/.ai-bridge-backups/`
   (timestamped ZIPs). Copy them off-device; also back up `control.db`
   (or `pg_dump ai_bridge`) nightly.
-- Rate limiting: 120 req/min per token/IP in-process. For production,
-  add proxy-level limiting and per-tenant quotas.
+- Rate limiting: 1200 req/min for authenticated tokens and 300 req/min for
+  anonymous IPs on general API paths; authentication flows have separate limits.
+  Redis can share limits between processes. Keep proxy-level limiting and
+  per-tenant quotas in front of public deployments.
+- The production control API runs one worker while background schedulers and
+  emergency-stop/OIDC pending state are process-local. Do not increase the
+  worker count until those components use shared durable coordination.
+- PostgreSQL deployments install `requirements-postgres.txt`. Tune
+  `AI_BRIDGE_PG_POOL_MIN_SIZE`, `AI_BRIDGE_PG_POOL_MAX_SIZE` and
+  `AI_BRIDGE_PG_POOL_WAIT_S` for the deployment; execute the PostgreSQL
+  integration check with `AI_BRIDGE_TEST_POSTGRES_URL` in a disposable test
+  database before release.
+- Browser outbound destinations default to public HTTPS; configure exact
+  internal host exceptions through `AI_BRIDGE_BROWSER_ALLOWED_HOSTS` and keep
+  host/container egress controls enabled. See `browser-security.md`.
+- Tasks can depend on earlier tasks submitted for the same device and tenant.
+  The agent claims a dependent task only after every parent completes. Agents
+  may save up to 1 MB of redacted checkpoint JSON while a task is running with
+  `PUT /api/agent/tasks/{task_id}/checkpoint`; operators can inspect the event
+  history at `GET /api/tasks/{task_id}/events`.
+- On control-plane startup, tasks left `running` are marked failed and receive
+  an `interrupted` event. Their side effects are uncertain, so inspect before
+  retrying. Queued tasks remain queued and will be available to agents.
+- Heartbeats may report `capabilities` and `inventory`; reports are persisted
+  in the device record, capped to 200 capabilities and 32 KB of inventory.

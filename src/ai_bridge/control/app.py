@@ -23,31 +23,31 @@ import ipaddress
 import json
 import os
 import secrets
+import socket
 import threading
 import time
 import uuid
+from html import escape
 from pathlib import Path
-from urllib.parse import urlencode, urlparse, parse_qs
+from urllib.parse import parse_qs, urlencode, urlparse
 
 import httpx
-
 from fastapi import Body, FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
 from starlette.datastructures import Headers
 
-from .. import tools
-from .. import terminal_manager
-from ..policy import Policy, TOOL_TIERS
+from .. import terminal_manager, tools
+from ..policy import TOOL_TIERS, Policy
 from ..security import redact, redact_obj
 from . import alerts as alertsmod
 from . import auth as authmod
-from . import metrics as metricsmod
 from . import db as dbmod
-from .dispatch import dispatch
-from .ratelimit import rate_limit, make_rate_limiter
+from . import metrics as metricsmod
 from .csrf import generate_csrf_token, validate_csrf_token
+from .dispatch import dispatch
+from .ratelimit import make_rate_limiter, rate_limit
 
 MAX_RESULT_CHARS = 512_000
 _DUMMY_SALT = "0" * 32
@@ -58,17 +58,20 @@ def _validate_webhook_url(url: str) -> None:
     if not url:
         return
     parsed = urlparse(url)
-    if parsed.scheme not in ("http", "https") or not parsed.netloc or not parsed.hostname:
-        raise HTTPException(status_code=400, detail="webhook_url must be an http(s) URL.")
+    if parsed.scheme != "https" or not parsed.netloc or not parsed.hostname or parsed.username or parsed.password:
+        raise HTTPException(status_code=400, detail="webhook_url must be an https URL without embedded credentials.")
     host = parsed.hostname.lower()
     if host in ("localhost", "127.0.0.1", "::1", "metadata.google.internal") or host.endswith(".localhost"):
         raise HTTPException(status_code=400, detail="Loopback and metadata webhooks are not allowed.")
     try:
-        ip = ipaddress.ip_address(host)
-        if ip.is_loopback or ip.is_private or ip.is_link_local or ip.is_multicast or ip.is_reserved or ip.is_unspecified:
-            raise HTTPException(status_code=400, detail="Private/loopback IP webhooks are not allowed.")
-    except ValueError:
-        pass
+        try:
+            addresses = [ipaddress.ip_address(host)]
+        except ValueError:
+            addresses = [ipaddress.ip_address(item[4][0]) for item in socket.getaddrinfo(host, parsed.port or 443, type=socket.SOCK_STREAM)]
+    except (OSError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail="Webhook host could not be resolved safely.") from exc
+    if not addresses or any(not address.is_global for address in addresses):
+        raise HTTPException(status_code=400, detail="Webhook destinations resolving to non-public IP addresses are not allowed.")
 
 
 def _valid_oauth_redirect_uri(uri: str) -> bool:
@@ -90,7 +93,9 @@ def _rate_limit(key: str, limit: int = 120, window: int = 60) -> None:
 
 
 def make_quick_sig(admin_token: str | None, approval_id: str, decision: str) -> str:
-    secret = (admin_token or "ai-bridge-secret").encode("utf-8")
+    if not admin_token:
+        raise ValueError("Quick approval links require AI_BRIDGE_ADMIN_TOKEN.")
+    secret = admin_token.encode("utf-8")
     msg = f"{approval_id}:{decision}".encode("utf-8")
     return hmac.new(secret, msg, hashlib.sha256).hexdigest()[:32]
 
@@ -124,7 +129,7 @@ def send_webhook_notification(
 
     approve_url = ""
     deny_url = ""
-    if app_id:
+    if app_id and admin_token:
         app_sig = make_quick_sig(admin_token, app_id, "approved")
         den_sig = make_quick_sig(admin_token, app_id, "denied")
         approve_url = f"{base_url}/api/approvals/quick/{app_id}?decision=approved&sig={app_sig}"
@@ -261,6 +266,7 @@ class TaskIn(BaseModel):
     tool: str
     args: dict = {}
     tenant: str = "default"
+    depends_on: list[str] = Field(default_factory=list, max_length=50)
 
 class ApprovalDecision(BaseModel):
     decision: str  # approved | denied
@@ -269,6 +275,9 @@ class ApprovalDecision(BaseModel):
 class TaskResultIn(BaseModel):
     status: str
     result: str = ""
+
+class TaskCheckpointIn(BaseModel):
+    checkpoint: dict = Field(default_factory=dict)
 
 class LoginIn(BaseModel):
     username: str
@@ -469,7 +478,10 @@ def _render_quick_decision_html(
     details_rows = ""
     if details:
         for k, v in details.items():
-            details_rows += f'<div class="row"><span class="label">{k}</span><span class="value">{v}</span></div>'
+            details_rows += (
+                f'<div class="row"><span class="label">{escape(str(k))}</span>'
+                f'<span class="value">{escape(str(v))}</span></div>'
+            )
         details_html = f'<div class="details-card">{details_rows}</div>'
     else:
         details_html = ""
@@ -479,7 +491,7 @@ def _render_quick_decision_html(
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-  <title>{title} • AI Bridge</title>
+  <title>{escape(title)} • AI Bridge</title>
   <style>
     :root {{
       --bg: #0f141c;
@@ -587,12 +599,12 @@ def _render_quick_decision_html(
 </head>
 <body>
   <div class="container">
-    <div class="badge {badge_class}">
-      <span>{badge_icon}</span>
-      <span>{badge_text}</span>
+    <div class="badge {escape(badge_class, quote=True)}">
+      <span>{escape(badge_icon)}</span>
+      <span>{escape(badge_text)}</span>
     </div>
-    <h1>{heading}</h1>
-    <p class="subtitle">{message}</p>
+    <h1>{escape(heading)}</h1>
+    <p class="subtitle">{escape(message)}</p>
     {details_html}
     <div class="actions">
       <a href="/" class="btn btn-primary">Open AI Bridge Dashboard</a>
@@ -611,6 +623,22 @@ def create_app(*, admin_token: str | None = None, db_path: Path | None = None, d
     data_dir = Path(os.environ.get("AI_BRIDGE_DATA_DIR", str(Path.home() / ".ai-bridge")))
     db_path = db_path or (data_dir / "control.db")
     conn = dbmod.connect(db_path=db_path, database_url=database_url)
+    # A process restart can leave tasks marked running after an agent vanished.
+    # Their side effects are uncertain, so surface them for operator review
+    # instead of silently rerunning non-idempotent tools.
+    with conn.transaction():
+        interrupted = conn.execute(
+            "SELECT id, tenant FROM tasks WHERE status='running'"
+        ).fetchall()
+        for task in interrupted:
+            conn.execute(
+                "UPDATE tasks SET status='failed', result=?, updated_at=? WHERE id=? AND status='running'",
+                ("Interrupted by control-plane restart; inspect effects before retrying.", dbmod.now(), task["id"]),
+            )
+            conn.execute(
+                "INSERT INTO task_events (task_id, tenant, event_type, actor, event_json, created_at) VALUES (?,?,?,?,?,?)",
+                (task["id"], task["tenant"], "interrupted", "system", json.dumps({"reason": "control_plane_restart"}), dbmod.now()),
+            )
     app = FastAPI(title="AI Bridge Control Plane", version="0.3.0")
     allowed_origins = [
         "http://127.0.0.1:5173", "http://localhost:5173", "http://201.79.36.129",
@@ -825,6 +853,42 @@ def create_app(*, admin_token: str | None = None, db_path: Path | None = None, d
     def audit(actor: str, device_id: str, tool: str, args: dict, decision: str, result: str = "", tenant: str = "default"):
         dbmod.audit(conn, tenant=tenant, actor=actor, device_id=device_id, tool=tool, args=args, decision=decision, result=result)
 
+    def record_task_event(task_id: str, tenant: str, event_type: str, actor: str, event: dict | None = None) -> None:
+        conn.execute(
+            "INSERT INTO task_events (task_id, tenant, event_type, actor, event_json, created_at) VALUES (?,?,?,?,?,?)",
+            (task_id, tenant, event_type, actor, json.dumps(redact_obj(event or {}), default=str), dbmod.now()),
+        )
+
+    def fail_waiting_dependents(root_task_id: str, tenant: str, actor: str, reason: str) -> None:
+        pending = [root_task_id]
+        seen = {root_task_id}
+        while pending:
+            failed_dependency = pending.pop()
+            children = conn.execute(
+                "SELECT t.id, t.status FROM task_dependencies d JOIN tasks t ON t.id=d.task_id "
+                "WHERE d.depends_on_task_id=? AND t.tenant=? AND t.status IN ('queued','needs_approval')",
+                (failed_dependency, tenant),
+            ).fetchall()
+            for child in children:
+                child_id = str(child["id"])
+                if child_id in seen:
+                    continue
+                seen.add(child_id)
+                now = dbmod.now()
+                conn.execute(
+                    "UPDATE tasks SET status='failed', result=?, updated_at=? WHERE id=? AND status IN ('queued','needs_approval')",
+                    (f"Dependency task {failed_dependency} ended with status {reason}.", now, child_id),
+                )
+                conn.execute(
+                    "UPDATE approvals SET status='denied', decided_by=?, decided_at=?, reason=? WHERE task_id=? AND status='pending'",
+                    (actor, now, "Dependency task failed before this task could run.", child_id),
+                )
+                record_task_event(
+                    child_id, tenant, "failed", actor,
+                    {"reason": "dependency_failed", "dependency_task_id": failed_dependency},
+                )
+                pending.append(child_id)
+
     from .workspace import install_workspace_routes
     install_workspace_routes(app, conn, require_role, audit)
 
@@ -931,7 +995,7 @@ def create_app(*, admin_token: str | None = None, db_path: Path | None = None, d
         require_role("viewer", x_admin_token, x_session_token)
         rows = conn.execute(
             "SELECT d.id, d.name, d.hostname, d.os, d.tenant, d.status, d.last_seen, d.revoked, d.created_at, "
-            "d.token_expires_at, d.policy_json, m.group_name, m.tags_json FROM devices d "
+            "d.token_expires_at, d.policy_json, d.capabilities_json, d.inventory_json, m.group_name, m.tags_json FROM devices d "
             "LEFT JOIN device_metadata m ON m.device_id=d.id WHERE d.tenant=?", (tenant,),
         ).fetchall()
         result = []
@@ -939,6 +1003,13 @@ def create_app(*, admin_token: str | None = None, db_path: Path | None = None, d
             d = dict(r)
             d["group"] = d.pop("group_name", None) or ""
             d["tags"] = json.loads(d.pop("tags_json", None) or "[]")
+            d["capabilities"] = json.loads(d.pop("capabilities_json", None) or "[]")
+            d["inventory"] = json.loads(d.pop("inventory_json", None) or "{}")
+            active = conn.execute(
+                "SELECT id, tool, status, updated_at FROM tasks WHERE device_id=? AND status IN ('queued','running','needs_approval') ORDER BY created_at LIMIT 1",
+                (d["id"],),
+            ).fetchone()
+            d["active_task"] = dict(active) if active else None
             raw_p = d.get("policy_json") or "{}"
             try:
                 parsed_p = json.loads(raw_p) if isinstance(raw_p, str) else (raw_p or {})
@@ -1335,6 +1406,21 @@ def create_app(*, admin_token: str | None = None, db_path: Path | None = None, d
         row = conn.execute("SELECT * FROM devices WHERE id=? AND tenant=? AND revoked=0", (body.device_id, body.tenant)).fetchone()
         if row is None:
             raise HTTPException(status_code=404, detail="Device not found or revoked.")
+        if len(set(body.depends_on)) != len(body.depends_on):
+            raise HTTPException(status_code=422, detail="depends_on must not contain duplicate task IDs.")
+        if body.depends_on:
+            placeholders = ",".join("?" for _ in body.depends_on)
+            dependencies = conn.execute(
+                f"SELECT id, device_id, tenant, status FROM tasks WHERE id IN ({placeholders})",
+                tuple(body.depends_on),
+            ).fetchall()
+            if len(dependencies) != len(body.depends_on) or any(
+                dep["device_id"] != body.device_id or dep["tenant"] != body.tenant
+                for dep in dependencies
+            ):
+                raise HTTPException(status_code=404, detail="One or more dependency tasks are unavailable for this device and tenant.")
+            if any(dep["status"] in {"failed", "cancelled", "timed_out"} for dep in dependencies):
+                raise HTTPException(status_code=409, detail="A dependency task has already failed or been cancelled.")
         tier = TOOL_TIERS.get(body.tool)
         if tier is None:
             raise HTTPException(status_code=400, detail=f"Unknown tool: {body.tool}")
@@ -1389,6 +1475,15 @@ def create_app(*, admin_token: str | None = None, db_path: Path | None = None, d
             conn.execute("INSERT INTO tasks (id, device_id, tenant, tool, args_json, tier, status, approval_id, created_at, updated_at)"
                          " VALUES (?,?,?,?,?,?,?,?,?,?)",
                          (task_id, body.device_id, body.tenant, body.tool, json.dumps(body.args), tier.value, status, approval_id, dbmod.now(), dbmod.now()))
+            for dependency_id in body.depends_on:
+                conn.execute(
+                    "INSERT INTO task_dependencies (task_id, depends_on_task_id, created_at) VALUES (?,?,?)",
+                    (task_id, dependency_id, dbmod.now()),
+                )
+            record_task_event(
+                task_id, body.tenant, "created", actor,
+                {"status": status, "tool": body.tool, "depends_on": body.depends_on},
+            )
         audit(actor, body.device_id, body.tool, body.args, status, tenant=body.tenant)
         if status == "queued":
             notify_tasks()
@@ -1439,6 +1534,43 @@ def create_app(*, admin_token: str | None = None, db_path: Path | None = None, d
                 return dict(row)
             await asyncio.sleep(min(0.15, rem))
 
+    @app.get("/api/tasks/{task_id}/events")
+    def list_task_events(task_id: str, x_admin_token: str | None = Header(default=None), x_session_token: str | None = Header(default=None)):
+        require_role("viewer", x_admin_token, x_session_token)
+        task = conn.execute("SELECT tenant FROM tasks WHERE id=?", (task_id,)).fetchone()
+        if task is None:
+            raise HTTPException(status_code=404, detail="Task not found.")
+        rows = conn.execute(
+            "SELECT event_type, actor, event_json, created_at FROM task_events WHERE task_id=? AND tenant=? ORDER BY id",
+            (task_id, task["tenant"]),
+        ).fetchall()
+        return [{**dict(item), "event": json.loads(item["event_json"] or "{}")} for item in rows]
+
+    @app.put("/api/agent/tasks/{task_id}/checkpoint")
+    def save_task_checkpoint(task_id: str, body: TaskCheckpointIn, x_device_token: str | None = Header(default=None)):
+        device = device_row(x_device_token)
+        task = conn.execute(
+            "SELECT tenant FROM tasks WHERE id=? AND device_id=? AND status='running'",
+            (task_id, device["id"]),
+        ).fetchone()
+        if task is None:
+            raise HTTPException(status_code=404, detail="Running task not found for this device.")
+        checkpoint_json = json.dumps(redact_obj(body.checkpoint), default=str)
+        if len(checkpoint_json.encode("utf-8")) > 1_000_000:
+            raise HTTPException(status_code=413, detail="Checkpoint exceeds the 1 MB limit.")
+        with conn.transaction():
+            cur = conn.execute(
+                "UPDATE tasks SET checkpoint_json=?, updated_at=? WHERE id=? AND device_id=? AND status='running'",
+                (checkpoint_json, dbmod.now(), task_id, device["id"]),
+            )
+            if cur.rowcount != 1:
+                raise HTTPException(status_code=409, detail="Task is no longer running.")
+            record_task_event(
+                task_id, str(task["tenant"]), "checkpoint_saved", f"device:{device['id']}",
+                {"size_bytes": len(checkpoint_json.encode("utf-8")), "keys": list(body.checkpoint)[:100]},
+            )
+        return {"task_id": task_id, "saved": True}
+
     @app.post("/api/tasks/{task_id}/cancel")
     def cancel_task(task_id: str, x_admin_token: str | None = Header(default=None), x_session_token: str | None = Header(default=None)):
         require_role("operator", x_admin_token, x_session_token)
@@ -1448,6 +1580,8 @@ def create_app(*, admin_token: str | None = None, db_path: Path | None = None, d
         if row["status"] in {"completed", "failed", "cancelled"}:
             return {"task_id": task_id, "status": row["status"]}
         conn.execute("UPDATE tasks SET status='cancelled', updated_at=? WHERE id=?", (dbmod.now(), task_id))
+        record_task_event(task_id, str(row["tenant"]), "cancelled", "operator", {})
+        fail_waiting_dependents(task_id, str(row["tenant"]), "operator", "cancelled")
         conn.commit()
         notify_tasks()
         audit("admin", row["device_id"], "cancel_task", {"task_id": task_id}, "allowed")
@@ -1545,7 +1679,11 @@ def create_app(*, admin_token: str | None = None, db_path: Path | None = None, d
         for row in rows:
             conn.execute("UPDATE approvals SET status='expired', decided_by='system', decided_at=? WHERE id=? AND status='pending'", (now, row["id"]))
             if row["task_id"]:
+                task = conn.execute("SELECT tenant FROM tasks WHERE id=?", (row["task_id"],)).fetchone()
                 conn.execute("UPDATE tasks SET status='cancelled', updated_at=? WHERE id=? AND status='needs_approval'", (now, row["task_id"]))
+                if task:
+                    record_task_event(row["task_id"], str(task["tenant"]), "cancelled", "system", {"reason": "approval_expired"})
+                    fail_waiting_dependents(row["task_id"], str(task["tenant"]), "system", "approval_expired")
             audit("system", "", "expire_approval", {"approval_id": row["id"]}, "expired")
         if rows:
             conn.commit()
@@ -1580,6 +1718,11 @@ def create_app(*, admin_token: str | None = None, db_path: Path | None = None, d
         if row["task_id"]:
             new_status = "queued" if body.decision == "approved" else "cancelled"
             conn.execute("UPDATE tasks SET status=?, updated_at=? WHERE id=?", (new_status, now, row["task_id"]))
+            task = conn.execute("SELECT tenant FROM tasks WHERE id=?", (row["task_id"],)).fetchone()
+            if task:
+                record_task_event(row["task_id"], str(task["tenant"]), new_status, actor, {"approval_id": approval_id})
+                if new_status == "cancelled":
+                    fail_waiting_dependents(row["task_id"], str(task["tenant"]), actor, "approval_denied")
         conn.commit()
         notify_tasks()
         audit(actor, "", "decide_approval", {"approval_id": approval_id, "decision": body.decision, "reason": body.reason}, "allowed")
@@ -1599,6 +1742,10 @@ def create_app(*, admin_token: str | None = None, db_path: Path | None = None, d
         conn.execute("UPDATE approvals SET status='denied', decided_by=?, decided_at=?, reason=? WHERE id=? AND status='pending'", (actor, now, feedback, approval_id))
         if row["task_id"]:
             conn.execute("UPDATE tasks SET status='cancelled', updated_at=? WHERE id=? AND status='needs_approval'", (now, row["task_id"]))
+            task = conn.execute("SELECT tenant FROM tasks WHERE id=?", (row["task_id"],)).fetchone()
+            if task:
+                record_task_event(row["task_id"], str(task["tenant"]), "cancelled", actor, {"reason": "approval_replanned"})
+                fail_waiting_dependents(row["task_id"], str(task["tenant"]), actor, "approval_replanned")
         conn.commit()
         notify_tasks()
         audit(actor, "", "replan_approval", {"approval_id": approval_id, "feedback": feedback}, "denied")
@@ -1624,7 +1771,7 @@ def create_app(*, admin_token: str | None = None, db_path: Path | None = None, d
                 status_code=400,
             )
 
-        expected_sig = make_quick_sig(token, approval_id, decision)
+        expected_sig = make_quick_sig(token, approval_id, decision) if token else ""
         if not sig or not hmac.compare_digest(sig.strip(), expected_sig):
             return HTMLResponse(
                 content=_render_quick_decision_html(
@@ -3849,12 +3996,24 @@ def create_app(*, admin_token: str | None = None, db_path: Path | None = None, d
         now_ts = dbmod.now()
         hostname = (body.get("hostname") or "").strip() if isinstance(body, dict) else ""
         os_val = (body.get("os") or "").strip() if isinstance(body, dict) else ""
+        capabilities = body.get("capabilities") if isinstance(body, dict) else None
+        inventory = body.get("inventory") if isinstance(body, dict) else None
         if hostname or os_val:
             cur_h = hostname if hostname else (row["hostname"] or "")
             cur_os = os_val if os_val else (row["os"] or "")
             conn.execute("UPDATE devices SET status='online', last_seen=?, hostname=?, os=? WHERE id=?", (now_ts, cur_h, cur_os, row["id"]))
         else:
             conn.execute("UPDATE devices SET status='online', last_seen=? WHERE id=?", (now_ts, row["id"]))
+        if isinstance(capabilities, list):
+            clean_capabilities = sorted({str(value).strip()[:100] for value in capabilities[:200] if str(value).strip()})
+            conn.execute("UPDATE devices SET capabilities_json=? WHERE id=?", (json.dumps(clean_capabilities), row["id"]))
+        if isinstance(inventory, dict):
+            # Keep reports bounded and redact credential-like values before they
+            # enter durable fleet inventory.
+            clean_inventory = redact_obj(inventory)
+            encoded_inventory = json.dumps(clean_inventory, default=str)
+            if len(encoded_inventory) <= 32_000:
+                conn.execute("UPDATE devices SET inventory_json=? WHERE id=?", (encoded_inventory, row["id"]))
         conn.commit()
 
         metrics = body.get("metrics") if isinstance(body, dict) else None
@@ -3960,7 +4119,11 @@ def create_app(*, admin_token: str | None = None, db_path: Path | None = None, d
                 return {"task": None, "emergency_stop": True}
             with conn.transaction():
                 candidate = conn.execute(
-                    "SELECT * FROM tasks WHERE device_id=? AND status='queued' ORDER BY created_at ASC LIMIT 1",
+                    "SELECT t.* FROM tasks AS t WHERE t.device_id=? AND t.status='queued' "
+                    "AND NOT EXISTS (SELECT 1 FROM task_dependencies d "
+                    "JOIN tasks parent ON parent.id=d.depends_on_task_id "
+                    "WHERE d.task_id=t.id AND parent.status!='completed') "
+                    "ORDER BY t.created_at ASC LIMIT 1",
                     (row["id"],),
                 ).fetchone()
                 if candidate is not None:
@@ -3970,12 +4133,19 @@ def create_app(*, admin_token: str | None = None, db_path: Path | None = None, d
                     )
                     if cur.rowcount == 1:
                         task = candidate
+                        record_task_event(
+                            str(candidate["id"]), str(candidate["tenant"]), "running",
+                            f"device:{row['id']}", {"device_id": row["id"]},
+                        )
                         break
             rem = deadline - time.time()
             if wait_sec <= 0 or rem <= 0:
                 return {"task": None}
             await asyncio.sleep(min(0.15, rem))
         out = dict(task)
+        metricsmod.record_task_queue_wait(
+            str(out.get("tool") or "unknown"), max(0.0, dbmod.now() - float(out.get("created_at") or dbmod.now()))
+        )
         # Tell the agent whether a human approved this task. Only approved records
         # that match the tool and have not expired grant approval.
         ap = out.get("approval_id")
@@ -4010,8 +4180,24 @@ def create_app(*, admin_token: str | None = None, db_path: Path | None = None, d
             if task["tool"] in ("take_screenshot", "capture_desktop_screenshot", "capture_desktop_frame", "set_of_marks_screenshot")
             else MAX_RESULT_CHARS
         )
-        conn.execute("UPDATE tasks SET status=?, result=?, updated_at=? WHERE id=?",
-                     (body.status, body.result[:result_cap], dbmod.now(), task_id))
+        cur = conn.execute(
+            "UPDATE tasks SET status=?, result=?, updated_at=? WHERE id=? AND device_id=? AND status='running'",
+            (body.status, body.result[:result_cap], dbmod.now(), task_id, row["id"]),
+        )
+        if cur.rowcount != 1:
+            current = conn.execute("SELECT status FROM tasks WHERE id=? AND device_id=?", (task_id, row["id"])).fetchone()
+            conn.rollback()
+            if current is None:
+                raise HTTPException(status_code=404, detail="Task not found for this device.")
+            if current["status"] == body.status:
+                return {"task_id": task_id, "status": current["status"], "idempotent": True}
+            raise HTTPException(status_code=409, detail=f"Task is already {current['status']} and cannot accept a {body.status} result.")
+        record_task_event(
+            task_id, str(task["tenant"]), body.status, f"device:{row['id']}",
+            {"device_id": row["id"]},
+        )
+        if body.status != "completed":
+            fail_waiting_dependents(task_id, str(task["tenant"]), f"device:{row['id']}", body.status)
         conn.commit()
         notify_tasks()
         if task["tool"] in ("capture_desktop_frame", "take_screenshot"):
@@ -4024,7 +4210,25 @@ def create_app(*, admin_token: str | None = None, db_path: Path | None = None, d
             except Exception:
                 pass
         audit("device", row["id"], task["tool"], json.loads(task["args_json"] or "{}"), body.status, body.result[:500], tenant=task["tenant"])
+        metricsmod.record_task_execution(
+            str(task["tool"]), body.status, max(0.0, dbmod.now() - float(task["created_at"] or dbmod.now()))
+        )
         return {"task_id": task_id, "status": body.status}
+
+    @app.middleware("http")
+    async def request_metrics_middleware(request: Request, call_next):
+        started = time.perf_counter()
+        status_code = 500
+        try:
+            response = await call_next(request)
+            status_code = response.status_code
+            return response
+        finally:
+            route = request.scope.get("route")
+            endpoint = getattr(route, "path", "unmatched")
+            duration = time.perf_counter() - started
+            metricsmod.record_http_request(request.method, endpoint, status_code)
+            metricsmod.record_http_duration(request.method, endpoint, duration)
 
     @app.middleware("http")
     async def bearer_auth_normalization(request: Request, call_next):
@@ -4062,7 +4266,7 @@ def create_app(*, admin_token: str | None = None, db_path: Path | None = None, d
             return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
         return await call_next(request)
 
-    from . import ai_api, v1_routes, mcp_routes
+    from . import ai_api, mcp_routes, v1_routes
     from .custom_agents import AgentRunner, install_custom_agent_routes
     ai_api.attach_ai_routes(
         app,
@@ -4377,8 +4581,8 @@ def create_app(*, admin_token: str | None = None, db_path: Path | None = None, d
     if not dist_dir.exists():
         dist_dir = Path(__file__).resolve().parent.parent.parent.parent / "apps" / "dashboard" / "dist"
     if dist_dir.exists():
-        from fastapi.staticfiles import StaticFiles
         from fastapi.responses import FileResponse
+        from fastapi.staticfiles import StaticFiles
 
         assets_dir = dist_dir / "assets"
         if assets_dir.exists():

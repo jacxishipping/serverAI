@@ -34,3 +34,19 @@ Session permissions are derived **exclusively on the backend** (`src/ai_bridge/c
   - Tier 3: Interactive desktop input & process launch (`desktop_mouse_move`, `desktop_click`, `desktop_keyboard`, `desktop_scroll`, `desktop_open_application`, `desktop_execute_command`).
   - Tier 4: High-risk system mutations (always require explicit human approval).
 - **Append-Only Audit Trail**: Every session creation, mode transition, human takeover, policy change, and MCP tool execution is recorded in `/api/v1/audit` with redacted payloads.
+
+## 5. Browser Session and Network Boundaries
+
+- Playwright contexts are isolated by authenticated MCP bearer principal and
+  run on one owner thread per principal. Anonymous Streamable HTTP browser
+  calls are rejected; stdio uses a process-local profile.
+- Browser requests are limited to public HTTPS destinations by default.
+  Exact administrator-configured hostnames in
+  `AI_BRIDGE_BROWSER_ALLOWED_HOSTS` can enable private hosts, HTTP, or custom
+  ports. The browser checks each request/redirect; production deployments must
+  also enforce host/container outbound network restrictions against DNS
+  rebinding and browser networking edge cases.
+- See `browser-security.md` for configuration and operational details.
+- TURN REST credentials require an administrator-supplied
+  `AI_BRIDGE_TURN_SECRET`. Without it, the server returns STUN-only ICE config;
+  it never generates TURN credentials from a built-in secret.

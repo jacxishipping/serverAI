@@ -178,6 +178,15 @@ class Poller:
             "hostname": platform.node(),
             "os": f"{platform.system()} {platform.release()}".strip(),
             "metrics": _collect_metrics(),
+            "capabilities": ["task.polling", "telemetry.system_metrics"],
+            "inventory": {
+                "runtime": {
+                    "python": platform.python_version(),
+                    "machine": platform.machine(),
+                    "system": platform.system(),
+                    "release": platform.release(),
+                }
+            },
         }
         try:
             hb = self._req("POST", "/api/agent/heartbeat", hb_body)

@@ -1,0 +1,2 @@
+# Install the application plus the PostgreSQL driver and connection-pool support.
+-e .[postgres]

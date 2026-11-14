@@ -10,7 +10,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from ai_bridge import tools, vision
-from ai_bridge.control.app import create_app, make_quick_sig, send_webhook_notification
+from ai_bridge.control.app import _render_quick_decision_html, create_app, make_quick_sig, send_webhook_notification
 from ai_bridge.control.dispatch import dispatch
 from ai_bridge.policy import Policy, decide
 
@@ -28,6 +28,27 @@ def test_quick_sig_generation():
     # Consistent HMAC
     expected = hmac.new(token.encode("utf-8"), f"{app_id}:approved".encode("utf-8"), hashlib.sha256).hexdigest()[:32]
     assert sig_app == expected
+
+
+def test_quick_sig_requires_configured_secret():
+    with pytest.raises(ValueError, match="AI_BRIDGE_ADMIN_TOKEN"):
+        make_quick_sig(None, "app-12345", "approved")
+
+
+def test_quick_decision_page_escapes_untrusted_content():
+    page = _render_quick_decision_html(
+        '<script>alert(1)</script>', 'info" onclick="alert(1)', "<img>",
+        "<svg>", "<script>heading</script>", "<script>message</script>",
+        {"<b>key</b>": "<script>detail</script>"},
+    )
+    assert "<script>" not in page
+    assert "<img>" not in page
+    assert "&lt;script&gt;" in page
+
+
+def test_quick_sig_requires_configured_secret():
+    with pytest.raises(ValueError, match="AI_BRIDGE_ADMIN_TOKEN"):
+        make_quick_sig(None, "app-12345", "approved")
 
 
 def test_quick_mobile_approval_lifecycle(tmp_path):

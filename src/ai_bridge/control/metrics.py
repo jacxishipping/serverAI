@@ -11,10 +11,10 @@ from typing import Any
 try:
     from prometheus_client import (
         CONTENT_TYPE_LATEST,
+        REGISTRY,
         Counter,
         Gauge,
         Histogram,
-        REGISTRY,
         generate_latest,
     )
     _PROMETHEUS_AVAILABLE = True
@@ -45,6 +45,12 @@ if _PROMETHEUS_AVAILABLE:
         ["tool"],
         buckets=(0.1, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0),
     )
+    TASK_QUEUE_WAIT_SECONDS = Histogram(
+        "aibridge_task_queue_wait_seconds",
+        "Time from task enqueue to device claim",
+        ["tool"],
+        buckets=(0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 120.0),
+    )
 
     QUEUE_DEPTH = Gauge(
         "aibridge_queue_depth",
@@ -58,6 +64,28 @@ if _PROMETHEUS_AVAILABLE:
         ["method", "endpoint", "status_code"],
     )
 
+    HTTP_REQUEST_DURATION_SECONDS = Histogram(
+        "aibridge_http_request_duration_seconds",
+        "Control plane request duration, labeled by route template",
+        ["method", "endpoint"],
+        buckets=(0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0),
+    )
+
+    WEBRTC_CAPTURE_SECONDS = Histogram(
+        "aibridge_webrtc_capture_seconds",
+        "Desktop frame capture duration",
+        buckets=(0.005, 0.01, 0.02, 0.033, 0.05, 0.1, 0.25, 0.5, 1.0),
+    )
+    WEBRTC_FRAME_PREP_SECONDS = Histogram(
+        "aibridge_webrtc_frame_prep_seconds",
+        "Captured frame conversion and preparation duration",
+        buckets=(0.001, 0.005, 0.01, 0.02, 0.033, 0.05, 0.1, 0.25, 0.5),
+    )
+    WEBRTC_FRAMES_DROPPED_TOTAL = Counter(
+        "aibridge_webrtc_frames_dropped_total",
+        "Desktop frames dropped due to capture errors",
+    )
+
     UPTIME_SECONDS = Gauge(
         "aibridge_uptime_seconds",
         "Total uptime of the AI Bridge Control Plane in seconds",
@@ -66,8 +94,13 @@ else:
     ACTIVE_DEVICES = None
     TASKS_TOTAL = None
     TASK_DURATION_SECONDS = None
+    TASK_QUEUE_WAIT_SECONDS = None
     QUEUE_DEPTH = None
     HTTP_REQUESTS_TOTAL = None
+    HTTP_REQUEST_DURATION_SECONDS = None
+    WEBRTC_CAPTURE_SECONDS = None
+    WEBRTC_FRAME_PREP_SECONDS = None
+    WEBRTC_FRAMES_DROPPED_TOTAL = None
     UPTIME_SECONDS = None
 
 
@@ -80,6 +113,11 @@ def record_task_execution(tool: str, status: str, duration: float | None = None)
         TASK_DURATION_SECONDS.labels(tool=tool).observe(duration)
 
 
+def record_task_queue_wait(tool: str, duration: float) -> None:
+    if _PROMETHEUS_AVAILABLE:
+        TASK_QUEUE_WAIT_SECONDS.labels(tool=tool).observe(max(0.0, duration))
+
+
 def record_http_request(method: str, endpoint: str, status_code: int) -> None:
     """Record metrics for an incoming HTTP request."""
     if not _PROMETHEUS_AVAILABLE:
@@ -89,6 +127,22 @@ def record_http_request(method: str, endpoint: str, status_code: int) -> None:
         endpoint=endpoint,
         status_code=str(status_code),
     ).inc()
+
+
+def record_http_duration(method: str, endpoint: str, duration: float) -> None:
+    if _PROMETHEUS_AVAILABLE:
+        HTTP_REQUEST_DURATION_SECONDS.labels(method=method, endpoint=endpoint).observe(max(0.0, duration))
+
+
+def record_webrtc_frame(capture_seconds: float | None = None, prep_seconds: float | None = None, dropped: bool = False) -> None:
+    if not _PROMETHEUS_AVAILABLE:
+        return
+    if capture_seconds is not None:
+        WEBRTC_CAPTURE_SECONDS.observe(max(0.0, capture_seconds))
+    if prep_seconds is not None:
+        WEBRTC_FRAME_PREP_SECONDS.observe(max(0.0, prep_seconds))
+    if dropped:
+        WEBRTC_FRAMES_DROPPED_TOTAL.inc()
 
 
 def update_fleet_gauges(conn: Any) -> None:

@@ -9,22 +9,158 @@ All tools enforce the same policy/approval model as desktop automation.
 from __future__ import annotations
 
 import base64
+import functools
+import hashlib
+import ipaddress
+import os
+import queue
+import socket
+import threading
+from dataclasses import dataclass
 from typing import Any
+from urllib.parse import urlsplit
 
 from .config import get_settings
 from .policy import Policy
 from .tools import _check, default_policy
 
-# Singleton Playwright browser state
-_pw = None
-_browser = None
-_context = None
-_page = None
+_runtime_local = threading.local()
+_runtimes: dict[str, "_BrowserRuntime"] = {}
+_runtimes_lock = threading.Lock()
+
+
+def _host_allowlist() -> set[str]:
+    return {host.strip().lower().rstrip(".") for host in os.environ.get("AI_BRIDGE_BROWSER_ALLOWED_HOSTS", "").split(",") if host.strip()}
+
+
+def validate_browser_url(url: str) -> str:
+    """Allow HTTPS to public hosts; private/HTTP destinations require exact admin allowlisting."""
+    try:
+        parsed = urlsplit(url)
+        host = (parsed.hostname or "").lower().rstrip(".")
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError("Malformed browser URL.") from exc
+    if parsed.scheme.lower() not in {"http", "https"} or not host or parsed.username or parsed.password:
+        raise ValueError("Browser URLs must be absolute http(s) URLs without embedded credentials.")
+    allowlisted = host in _host_allowlist()
+    if allowlisted:
+        return url
+    if parsed.scheme.lower() != "https":
+        raise PermissionError("HTTP browser destinations require an exact AI_BRIDGE_BROWSER_ALLOWED_HOSTS entry.")
+    if port not in (None, 443):
+        raise PermissionError("Nonstandard browser ports require an exact AI_BRIDGE_BROWSER_ALLOWED_HOSTS entry.")
+    try:
+        ip = ipaddress.ip_address(host)
+        addresses = [ip]
+    except ValueError:
+        try:
+            addresses = [ipaddress.ip_address(item[4][0]) for item in socket.getaddrinfo(host, port or 443, type=socket.SOCK_STREAM)]
+        except (OSError, ValueError) as exc:
+            raise PermissionError("Browser destination could not be resolved safely.") from exc
+    if not addresses or any(not address.is_global for address in addresses):
+        raise PermissionError("Browser destinations resolving to non-public IP addresses are blocked.")
+    return url
+
+
+@dataclass
+class _BrowserCall:
+    fn: Any
+    args: tuple
+    kwargs: dict
+    done: threading.Event
+    result: list
+
+
+class _ExpiredBrowserSession(RuntimeError):
+    pass
+
+
+class _BrowserRuntime:
+    """One Playwright owner thread and isolated Chromium context per principal."""
+    IDLE_TIMEOUT_SECONDS = 900
+
+    def __init__(self, principal: str) -> None:
+        self.principal = principal
+        self.calls: queue.Queue[_BrowserCall | None] = queue.Queue()
+        self._state_lock = threading.Lock()
+        self._closed = False
+        self.thread = threading.Thread(target=self._run, name="browser-session", daemon=True)
+        self.thread.start()
+
+    def _run(self) -> None:
+        _runtime_local.runtime = self
+        while True:
+            try:
+                call = self.calls.get(timeout=self.IDLE_TIMEOUT_SECONDS)
+            except queue.Empty:
+                with self._state_lock:
+                    if not self.calls.empty():
+                        continue
+                    self._closed = True
+                break
+            if call is None:
+                with self._state_lock:
+                    self._closed = True
+                break
+            try:
+                call.result.append((True, call.fn(*call.args, **call.kwargs)))
+            except BaseException as exc:
+                call.result.append((False, exc))
+            finally:
+                call.done.set()
+        try:
+            _close_browser()
+        except Exception:
+            pass
+        with _runtimes_lock:
+            if _runtimes.get(self.principal) is self:
+                _runtimes.pop(self.principal, None)
+
+    def invoke(self, fn: Any, *args: Any, **kwargs: Any) -> Any:
+        call = _BrowserCall(fn, args, kwargs, threading.Event(), [])
+        with self._state_lock:
+            if self._closed:
+                raise _ExpiredBrowserSession("Browser session expired while idle.")
+            self.calls.put(call)
+        if not call.done.wait(timeout=180):
+            raise TimeoutError("Browser operation exceeded the 180 second limit.")
+        succeeded, result = call.result[0]
+        if not succeeded:
+            raise result
+        return result
+
+
+def _in_browser_session(fn: Any) -> Any:
+    @functools.wraps(fn)
+    def wrapped(*args: Any, session_id: str | None = None, **kwargs: Any) -> Any:
+        # Direct library callers use one process-local identity. MCP wrappers
+        # supply a token-derived identity and reject anonymous HTTP requests.
+        principal = session_id or f"local:{os.getpid()}"
+        for _ in range(2):
+            with _runtimes_lock:
+                runtime = _runtimes.get(principal)
+                if runtime is None or not runtime.thread.is_alive():
+                    runtime = _BrowserRuntime(principal)
+                    _runtimes[principal] = runtime
+            try:
+                return runtime.invoke(fn, *args, **kwargs)
+            except _ExpiredBrowserSession:
+                with _runtimes_lock:
+                    if _runtimes.get(principal) is runtime:
+                        _runtimes.pop(principal, None)
+        raise RuntimeError("Could not create a live browser session.")
+    return wrapped
 
 
 def _ensure_browser(headless: bool = True) -> Any:
-    """Lazy-initialize Playwright browser (Chromium). Returns the active page."""
-    global _pw, _browser, _context, _page
+    """Create/reuse the isolated Playwright context owned by this worker thread."""
+    runtime = getattr(_runtime_local, "runtime", None)
+    if runtime is None:
+        raise RuntimeError("Browser operations must run inside an owned browser session.")
+    state = getattr(_runtime_local, "browser_state", None)
+    if state is not None and state.get("page") is not None and not state["page"].is_closed():
+        return state["page"]
     try:
         from playwright.sync_api import sync_playwright
     except ImportError as exc:
@@ -33,61 +169,80 @@ def _ensure_browser(headless: bool = True) -> Any:
             "Install it with: pip install playwright && playwright install chromium"
         ) from exc
 
-    if _page is not None and not _page.is_closed():
-        return _page
-
-    # Clean up stale state
-    if _browser is not None:
-        try:
-            _browser.close()
-        except Exception:
-            pass
-    if _pw is not None:
-        try:
-            _pw.stop()
-        except Exception:
-            pass
-
-    _pw = sync_playwright().start()
-    _browser = _pw.chromium.launch(headless=headless)
-    _context = _browser.new_context(
-        viewport={"width": 1280, "height": 720},
-        user_agent=(
+    if state is not None:
+        _close_browser()
+    pw = sync_playwright().start()
+    context_options = {
+        "viewport": {"width": 1280, "height": 720},
+        "accept_downloads": True,
+        "user_agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
             "(KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"
         ),
-    )
-    _page = _context.new_page()
-    return _page
+    }
+    persistent = os.environ.get("AI_BRIDGE_BROWSER_PERSIST_PROFILES", "0") == "1"
+    if persistent:
+        from pathlib import Path
+
+        profile_id = hashlib.sha256(runtime.principal.encode()).hexdigest()
+        profile_dir = get_settings().data_dir / "browser-profiles" / profile_id
+        profile_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            os.chmod(profile_dir.parent, 0o700)
+            os.chmod(profile_dir, 0o700)
+        except OSError:
+            pass
+        context = pw.chromium.launch_persistent_context(
+            user_data_dir=str(Path(profile_dir)), headless=headless, **context_options
+        )
+        browser = context.browser
+    else:
+        browser = pw.chromium.launch(headless=headless)
+        context = browser.new_context(**context_options)
+    def guard_request(route: Any) -> None:
+        request_url = route.request.url
+        scheme = urlsplit(request_url).scheme.lower()
+        if scheme in {"about", "data", "blob"}:
+            route.continue_()
+            return
+        try:
+            validate_browser_url(request_url)
+            route.continue_()
+        except Exception:
+            route.abort("blockedbyclient")
+
+    context.route("**/*", guard_request)
+    page = context.pages[0] if context.pages else context.new_page()
+    _runtime_local.browser_state = {"pw": pw, "browser": browser, "context": context, "page": page}
+    return page
 
 
 def _close_browser() -> None:
-    """Close the browser and clean up resources."""
-    global _pw, _browser, _context, _page
-    if _page is not None:
+    """Close this principal's browser and release its Playwright resources."""
+    state = getattr(_runtime_local, "browser_state", None)
+    if state is None:
+        return
+    if state.get("page") is not None:
         try:
-            _page.close()
+            state["page"].close()
         except Exception:
             pass
-        _page = None
-    if _context is not None:
+    if state.get("context") is not None:
         try:
-            _context.close()
+            state["context"].close()
         except Exception:
             pass
-        _context = None
-    if _browser is not None:
+    if state.get("browser") is not None:
         try:
-            _browser.close()
+            state["browser"].close()
         except Exception:
             pass
-        _browser = None
-    if _pw is not None:
+    if state.get("pw") is not None:
         try:
-            _pw.stop()
+            state["pw"].stop()
         except Exception:
             pass
-        _pw = None
+    _runtime_local.browser_state = None
 
 
 def _page_info(page) -> dict:
@@ -133,6 +288,7 @@ def browser_navigate(
     """
     eff_policy = policy or default_policy()
     _check("browser_navigate", approval_granted=approval_granted, policy=eff_policy)
+    validate_browser_url(url)
     page = _ensure_browser()
     page.goto(url, wait_until=wait_until, timeout=timeout * 1000)
     return {"ok": True, "action": "browser_navigate", **_page_info(page)}
@@ -342,9 +498,9 @@ def browser_new_page(
     _check("browser_new_page", approval_granted=approval_granted, policy=eff_policy)
     page = _ensure_browser()
     new_page = page.context.new_page()
-    global _page
-    _page = new_page
+    _runtime_local.browser_state["page"] = new_page
     if url:
+        validate_browser_url(url)
         new_page.goto(url)
     return {"ok": True, "action": "browser_new_page", **_page_info(new_page)}
 
@@ -461,18 +617,22 @@ def browser_download_file(
     eff_policy = policy or default_policy()
     _check("browser_download_file", approval_granted=approval_granted, policy=eff_policy)
     page = _ensure_browser()
-    from urllib.parse import urlparse
-    parsed = urlparse(url)
-    if parsed.scheme not in {"http", "https"}:
-        raise ValueError(f"URL must be http(s): {url}")
-    fname = filename or (parsed.path.split("/")[-1] or "download")
+    parsed = urlsplit(validate_browser_url(url))
+    requested_name = filename or (parsed.path.rsplit("/", 1)[-1] or "download")
+    fname = os.path.basename(requested_name.replace("\\", "/"))
+    if fname in {"", ".", ".."} or "\x00" in fname:
+        raise ValueError("Download filename must be a plain file name.")
     out_dir = get_settings().data_dir
     out_dir.mkdir(parents=True, exist_ok=True)
     out_path = out_dir / fname
     # Use browser context to download (respects cookies/session)
     with page.expect_download() as download_info:
-        page.evaluate(f"window.location.href = {url!r}")
+        page.evaluate("url => { window.location.href = url; }", url)
     download = download_info.value
+    download_path = download.path()
+    if download_path and os.path.getsize(download_path) > 100 * 1024 * 1024:
+        download.cancel()
+        raise ValueError("Downloads larger than 100 MiB are blocked.")
     download.save_as(str(out_path))
     return {
         "ok": True,
@@ -482,3 +642,11 @@ def browser_download_file(
         "filename": fname,
         **_page_info(page),
     }
+
+
+# Every public browser operation executes on the principal's Playwright owner
+# thread. That preserves browser persistence without sharing pages or cookies
+# across authenticated MCP principals, and avoids cross-thread Playwright use.
+for _tool_name, _tool in tuple(globals().items()):
+    if _tool_name.startswith("browser_") and callable(_tool):
+        globals()[_tool_name] = _in_browser_session(_tool)
