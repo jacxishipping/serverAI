@@ -30,8 +30,8 @@ that platform path has been exercised or production-ready.
 - Task dependencies, redacted checkpoints, durable task events and restart
   reconciliation are implemented. Interrupted running tasks are marked failed
   for operator review rather than replayed. Project memory APIs record source,
-  optional same-tenant task evidence and expiry; custom agents do not yet load
-  this shared project memory automatically.
+  optional same-tenant task evidence and expiry; custom agents with a matching
+  project ID load bounded, unexpired entries into their system context.
 - Heartbeats can persist a bounded device capability list and inventory object;
   the shared Python poller reports basic runtime and resource telemetry. A full
   installed-application inventory and native-agent parity contract remain open.
@@ -67,7 +67,7 @@ that platform path has been exercised or production-ready.
   workflow-verification targets. No benchmark result is recorded here.
 - A full named-role multi-agent supervisor/planner/researcher/developer/tester/
   security/recovery runtime. Current custom agents are scheduled bounded loops.
-- Automatic task resume from checkpoints, cross-agent project memory retrieval,
+- Automatic task resume from checkpoints, cross-agent memory synchronization,
   or comprehensive device application/capability inventory.
 - Production security certification, multi-tenant isolation certification, or
   clean multi-host deployment validation.

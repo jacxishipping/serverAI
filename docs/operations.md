@@ -38,4 +38,6 @@
 - Project memory is stored by tenant and project. `POST /api/projects/{id}/memory`
   accepts a source label, optional same-tenant task evidence, and a retention
   period of 1–365 days; viewers can list unexpired entries and admins can delete
-  them. Memory content is redacted before storage.
+  them. Memory content is redacted before storage. Set `project_id` on a custom
+  agent to include up to 20 unexpired entries (bounded to 12 KB) in its next
+  run's system context.

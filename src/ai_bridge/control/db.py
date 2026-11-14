@@ -95,6 +95,7 @@ CREATE TABLE IF NOT EXISTS custom_agents (
   name TEXT NOT NULL,
   instruction TEXT NOT NULL,
   tenant TEXT NOT NULL DEFAULT 'default',
+  project_id TEXT,
   provider TEXT NOT NULL DEFAULT 'openai',
   model TEXT,
   base_url TEXT,

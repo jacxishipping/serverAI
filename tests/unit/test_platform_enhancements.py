@@ -11,7 +11,6 @@ from ai_bridge.control import alerts as alertsmod
 from ai_bridge.control import custom_agents
 from ai_bridge.control.app import create_app
 
-
 ADMIN = "test-admin-enhancements"
 HEADERS = {"x-admin-token": ADMIN}
 
@@ -244,6 +243,7 @@ def test_agent_ask_endpoint_and_native_tools(tmp_path, monkeypatch):
             json={
                 "name": "SupervisorAgent",
                 "instruction": "Coordinate tasks across devices and peer agents",
+                "project_id": "serverAI",
                 "provider": "openai",
                 "device_ids": ["dev-test-1"],
                 "enabled": True,
@@ -251,6 +251,13 @@ def test_agent_ask_endpoint_and_native_tools(tmp_path, monkeypatch):
         )
         assert r1.status_code == 200
         supervisor_id = r1.json()["agent"]["id"]
+        assert r1.json()["agent"]["project_id"] == "serverAI"
+        memory = client.post(
+            "/api/projects/serverAI/memory",
+            headers=HEADERS,
+            json={"tenant": "default", "title": "API contract", "content": "All task results must be claimed first.", "source": "verified engineering note"},
+        )
+        assert memory.status_code == 200
 
         r2 = client.post(
             "/api/agents",
@@ -310,6 +317,10 @@ def test_agent_ask_endpoint_and_native_tools(tmp_path, monkeypatch):
     def fake_urlopen(req, timeout=90):
         call_seq["n"] += 1
         n = call_seq["n"]
+        if n == 1:
+            prompt_messages = json.loads(req.data)["messages"]
+            system_message = next(message["content"] for message in prompt_messages if message["role"] == "system")
+            assert "All task results must be claimed first." in system_message
         if n == 1:
             msg = {
                 "role": "assistant",
