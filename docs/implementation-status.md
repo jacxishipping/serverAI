@@ -27,6 +27,14 @@ that platform path has been exercised or production-ready.
   isolation and destination policy are described in `browser-security.md`.
 - OIDC, custom scheduled agents, agent run history and per-agent memory code
   exist, with configuration/provider requirements.
+- Task dependencies, redacted checkpoints, durable task events and restart
+  reconciliation are implemented. Interrupted running tasks are marked failed
+  for operator review rather than replayed. Project memory APIs record source,
+  optional same-tenant task evidence and expiry; custom agents do not yet load
+  this shared project memory automatically.
+- Heartbeats can persist a bounded device capability list and inventory object;
+  the shared Python poller reports basic runtime and resource telemetry. A full
+  installed-application inventory and native-agent parity contract remain open.
 
 ## Validation boundaries
 
@@ -59,8 +67,8 @@ that platform path has been exercised or production-ready.
   workflow-verification targets. No benchmark result is recorded here.
 - A full named-role multi-agent supervisor/planner/researcher/developer/tester/
   security/recovery runtime. Current custom agents are scheduled bounded loops.
-- Complete durable task checkpoint recovery, project memory provenance, or
-  comprehensive device application/capability inventory.
+- Automatic task resume from checkpoints, cross-agent project memory retrieval,
+  or comprehensive device application/capability inventory.
 - Production security certification, multi-tenant isolation certification, or
   clean multi-host deployment validation.
 - Automatic installation of signed agent updates. The update path verifies

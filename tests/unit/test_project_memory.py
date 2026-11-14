@@ -4,7 +4,6 @@ from fastapi.testclient import TestClient
 
 from ai_bridge.control.app import create_app
 
-
 ADMIN = "project-memory-test-token"
 
 
