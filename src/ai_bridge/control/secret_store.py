@@ -23,6 +23,10 @@ def _fernet() -> Fernet | None:
     key = os.environ.get("AI_BRIDGE_DB_ENCRYPTION_KEY", "").strip()
     if not key:
         return None
+    return _make_fernet(key)
+
+
+def _make_fernet(key: str) -> Fernet:
     try:
         return Fernet(key.encode("ascii"))
     except (ValueError, UnicodeEncodeError) as exc:
@@ -97,4 +101,54 @@ def migrate_database_secrets(conn: Any) -> int:
             changed += sum(value != old for value, old in zip(values, original))
     if changed:
         conn.commit()
+    return changed
+
+
+def rotate_database_secrets(conn: Any, old_key: str, new_key: str) -> int:
+    """Re-encrypt every protected credential field atomically with a new key."""
+    if not old_key.strip() or not new_key.strip():
+        raise SecretStoreError("Both old and new database encryption keys are required.")
+    old_fernet = _make_fernet(old_key.strip())
+    new_fernet = _make_fernet(new_key.strip())
+
+    def rotate(value: Any) -> str:
+        text = str(value or "")
+        if not text:
+            return text
+        if text.startswith(PREFIX):
+            try:
+                plaintext = old_fernet.decrypt(text[len(PREFIX):].encode("ascii"))
+            except (InvalidToken, UnicodeEncodeError) as exc:
+                raise SecretStoreError("Credential rotation aborted: an encrypted field cannot be opened with the old key.") from exc
+        else:
+            plaintext = text.encode("utf-8")
+        return PREFIX + new_fernet.encrypt(plaintext).decode("ascii")
+
+    changed = 0
+    with conn.transaction():
+        settings = conn.execute("SELECT key, value FROM settings").fetchall()
+        for row in settings:
+            key = str(row["key"] or "")
+            value = str(row["value"] or "")
+            is_secret = (
+                key == "ai_default_key"
+                or (key.startswith("ai_") and key.endswith("_key"))
+                or key in {"webhook_url", "alert_webhooks"}
+            )
+            if value.startswith(PREFIX) or (is_secret and value):
+                conn.execute("UPDATE settings SET value=? WHERE key=?", (rotate(value), key))
+                changed += 1
+
+        servers = conn.execute(
+            "SELECT id, auth_token, oauth_client_secret, oauth_refresh_token, headers_json FROM mcp_servers"
+        ).fetchall()
+        for row in servers:
+            values = [rotate(row[column]) for column in _MCP_COLUMNS]
+            originals = [str(row[column] or "") for column in _MCP_COLUMNS]
+            if values != originals:
+                conn.execute(
+                    "UPDATE mcp_servers SET auth_token=?, oauth_client_secret=?, oauth_refresh_token=?, headers_json=? WHERE id=?",
+                    (*values, row["id"]),
+                )
+                changed += sum(value != old for value, old in zip(values, originals))
     return changed

@@ -119,3 +119,8 @@ with credentials supplied privately through the process environment. Restore
 with `pg_restore` into a new isolated database, verify migrations and record
 counts, and run the same application checks. SQLite tests do not validate
 PostgreSQL backup, query plans or cross-worker behavior.
+
+Database credential key rotation is available through
+`python -m ai_bridge.control.rotate_secrets`. Follow the maintenance-window,
+backup and verification steps in `secret-key-rotation.md`; keep the old key
+until a rotated-backup restore drill succeeds.

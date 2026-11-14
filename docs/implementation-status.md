@@ -22,7 +22,8 @@ that platform path has been exercised or production-ready.
 - Database-stored provider keys, webhook credentials and MCP bearer/OAuth
   secrets/headers are Fernet-encrypted when a key is configured. The production
   Compose profile requires the key and performs legacy-field encryption at
-  startup; key rotation and encrypted backup/restore drills remain unverified.
+  startup. An operator-run key rotation command is available; rotation and
+  encrypted backup/restore drills have not been run in this environment.
 - Linux, Windows and macOS Python agent entry points exist and use the shared
   poller. Windows also has a native C++ service/desktop implementation.
 - The dashboard has React/TypeScript source and build/test workflows.
