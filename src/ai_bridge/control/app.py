@@ -1649,9 +1649,11 @@ def create_app(*, admin_token: str | None = None, db_path: Path | None = None, d
         row = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
         if row is None:
             raise HTTPException(status_code=404, detail="Task not found.")
-        conn.execute("DELETE FROM approvals WHERE task_id=?", (task_id,))
-        conn.execute("DELETE FROM tasks WHERE id=?", (task_id,))
-        conn.commit()
+        with conn.transaction():
+            fail_waiting_dependents(task_id, str(row["tenant"]), actor, "parent_deleted")
+            conn.execute("DELETE FROM approvals WHERE task_id=?", (task_id,))
+            conn.execute("DELETE FROM task_dependencies WHERE task_id=? OR depends_on_task_id=?", (task_id, task_id))
+            conn.execute("DELETE FROM tasks WHERE id=?", (task_id,))
         audit(actor, row["device_id"], "delete_task", {"task_id": task_id}, "allowed")
         return {"task_id": task_id, "deleted": True}
 
@@ -1659,10 +1661,19 @@ def create_app(*, admin_token: str | None = None, db_path: Path | None = None, d
     def clear_tasks(status: str | None = None, x_admin_token: str | None = Header(default=None), x_session_token: str | None = Header(default=None)):
         actor = require_role("admin", x_admin_token, x_session_token)
         if status and status != "all":
-            cur = conn.execute("DELETE FROM tasks WHERE status=?", (status,))
+            doomed = conn.execute("SELECT id, tenant FROM tasks WHERE status=?", (status,)).fetchall()
         else:
-            cur = conn.execute("DELETE FROM tasks WHERE status IN ('completed', 'failed', 'cancelled', 'timed_out')")
-        conn.commit()
+            doomed = conn.execute("SELECT id, tenant FROM tasks WHERE status IN ('completed', 'failed', 'cancelled', 'timed_out')").fetchall()
+        with conn.transaction():
+            for task in doomed:
+                fail_waiting_dependents(str(task["id"]), str(task["tenant"]), actor, "parent_deleted")
+            task_ids = [str(task["id"]) for task in doomed]
+            for task_id in task_ids:
+                conn.execute("DELETE FROM task_dependencies WHERE task_id=? OR depends_on_task_id=?", (task_id, task_id))
+            if status and status != "all":
+                cur = conn.execute("DELETE FROM tasks WHERE status=?", (status,))
+            else:
+                cur = conn.execute("DELETE FROM tasks WHERE status IN ('completed', 'failed', 'cancelled', 'timed_out')")
         audit(actor, "", "clear_tasks", {"status": status or "finished", "deleted_count": cur.rowcount}, "allowed")
         return {"deleted_count": cur.rowcount}
 
@@ -4121,8 +4132,8 @@ def create_app(*, admin_token: str | None = None, db_path: Path | None = None, d
                 candidate = conn.execute(
                     "SELECT t.* FROM tasks AS t WHERE t.device_id=? AND t.status='queued' "
                     "AND NOT EXISTS (SELECT 1 FROM task_dependencies d "
-                    "JOIN tasks parent ON parent.id=d.depends_on_task_id "
-                    "WHERE d.task_id=t.id AND parent.status!='completed') "
+                    "LEFT JOIN tasks parent ON parent.id=d.depends_on_task_id "
+                    "WHERE d.task_id=t.id AND (parent.id IS NULL OR parent.status!='completed')) "
                     "ORDER BY t.created_at ASC LIMIT 1",
                     (row["id"],),
                 ).fetchone()

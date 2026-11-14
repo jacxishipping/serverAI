@@ -83,6 +83,22 @@ def test_dependency_fails_when_parent_is_cancelled(tmp_path):
     assert child_state["status"] == "failed"
 
 
+def test_deleting_dependency_parent_fails_waiting_children(tmp_path):
+    client = TestClient(create_app(admin_token=ADMIN, db_path=tmp_path / "dependency-delete.db"))
+    parent_id, _device_token = _running_task(client)
+    device_id = client.get("/api/devices", headers={"X-Admin-Token": ADMIN}).json()[0]["id"]
+    child = client.post(
+        "/api/tasks",
+        json={"device_id": device_id, "tool": "get_system_info", "depends_on": [parent_id]},
+        headers={"X-Admin-Token": ADMIN},
+    ).json()
+    removed = client.delete(f"/api/tasks/{parent_id}", headers={"X-Admin-Token": ADMIN})
+    assert removed.status_code == 200
+    child_state = client.get(f"/api/tasks/{child['task_id']}", headers={"X-Admin-Token": ADMIN}).json()
+    assert child_state["status"] == "failed"
+    assert client.get("/api/agent/tasks/next", headers={"X-Device-Token": _device_token}).json()["task"] is None
+
+
 def test_restart_marks_running_task_for_operator_review(tmp_path):
     db_path = tmp_path / "restart.db"
     first = TestClient(create_app(admin_token=ADMIN, db_path=db_path))
