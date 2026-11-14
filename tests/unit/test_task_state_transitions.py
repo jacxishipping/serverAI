@@ -99,6 +99,24 @@ def test_deleting_dependency_parent_fails_waiting_children(tmp_path):
     assert client.get("/api/agent/tasks/next", headers={"X-Device-Token": _device_token}).json()["task"] is None
 
 
+def test_admin_terminal_transition_records_event_and_fails_dependents(tmp_path):
+    client = TestClient(create_app(admin_token=ADMIN, db_path=tmp_path / "admin-transition.db"))
+    parent_id, _device_token = _running_task(client)
+    device_id = client.get("/api/devices", headers={"X-Admin-Token": ADMIN}).json()[0]["id"]
+    child = client.post(
+        "/api/tasks",
+        json={"device_id": device_id, "tool": "get_system_info", "depends_on": [parent_id]},
+        headers={"X-Admin-Token": ADMIN},
+    ).json()
+    changed = client.put(f"/api/tasks/{parent_id}", json={"status": "failed"}, headers={"X-Admin-Token": ADMIN})
+    assert changed.status_code == 200
+    assert changed.json()["status"] == "failed"
+    child_state = client.get(f"/api/tasks/{child['task_id']}", headers={"X-Admin-Token": ADMIN}).json()
+    assert child_state["status"] == "failed"
+    events = client.get(f"/api/tasks/{parent_id}/events", headers={"X-Admin-Token": ADMIN}).json()
+    assert events[-1]["event_type"] == "admin_updated"
+
+
 def test_restart_marks_running_task_for_operator_review(tmp_path):
     db_path = tmp_path / "restart.db"
     first = TestClient(create_app(admin_token=ADMIN, db_path=db_path))

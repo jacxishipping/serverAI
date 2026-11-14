@@ -1640,11 +1640,18 @@ def create_app(*, admin_token: str | None = None, db_path: Path | None = None, d
             if ap["tool"] and ap["tool"] != tool:
                 raise HTTPException(status_code=409, detail="Task approval tool mismatch.")
 
-        conn.execute(
-            "UPDATE tasks SET tool=?, args_json=?, tier=?, status=?, approval_id=?, updated_at=? WHERE id=?",
-            (tool, args_json, tier_enum.value, status, approval_id, dbmod.now(), task_id),
-        )
-        conn.commit()
+        with conn.transaction():
+            conn.execute(
+                "UPDATE tasks SET tool=?, args_json=?, tier=?, status=?, approval_id=?, updated_at=? WHERE id=?",
+                (tool, args_json, tier_enum.value, status, approval_id, dbmod.now(), task_id),
+            )
+            if status != row["status"] or payload_changed:
+                record_task_event(
+                    task_id, str(row["tenant"]), "admin_updated", actor,
+                    {"from_status": row["status"], "to_status": status, "tool_changed": tool != row["tool"], "args_changed": args_json != row["args_json"]},
+                )
+            if status in {"failed", "cancelled", "timed_out"} and status != row["status"]:
+                fail_waiting_dependents(task_id, str(row["tenant"]), actor, status)
         if status == "queued":
             notify_tasks()
         audit(actor, row["device_id"], "update_task", {"task_id": task_id, "tool": tool, "status": status}, "allowed")
