@@ -34,13 +34,14 @@
   editors are not exposed by these operations panels; their existing previews
   remain explicitly separate from live operations.
 - Tier-4/device override semantics, tenant isolation and horizontal deployment
-  need a dedicated security review. The existing control plane keeps emergency
-  stop and OIDC pending state in process memory: use one worker, and do not assume
-  those states survive restart. This release is not a security certification.
+  need a dedicated security review. Emergency-stop and single-use OIDC pending
+  state are database-backed and survive restart, but emergency-stop changes are
+  not propagated between live workers. This release is not a security
+  certification.
 - The production container currently uses one API worker because background
-  schedulers and emergency-stop/OIDC state are process-local. PostgreSQL uses a
-  bounded connection pool configured with `AI_BRIDGE_PG_POOL_*`; validate it
-  against a live PostgreSQL service before production rollout.
+  schedulers and several locks remain process-local. PostgreSQL uses a bounded
+  connection pool configured with `AI_BRIDGE_PG_POOL_*`; validate it against a
+  live PostgreSQL service before production rollout.
 - Set `AI_BRIDGE_TURN_SECRET` to a high-entropy secret before using TURN REST
   credentials. Without it, ICE configuration is STUN-only.
 - Core navigation/sign-in translations ship as a 20-locale preview with RTL

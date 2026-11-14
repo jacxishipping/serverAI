@@ -656,7 +656,8 @@ def create_app(*, admin_token: str | None = None, db_path: Path | None = None, d
                        allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
     app.state.conn = conn
     app.state.admin_token = token
-    app.state.emergency_stop = False
+    stop_row = conn.execute("SELECT value FROM settings WHERE key='emergency_stop'").fetchone()
+    app.state.emergency_stop = bool(stop_row and str(stop_row["value"]).lower() == "true")
     task_cond = threading.Condition()
     app.state.task_cond = task_cond
 
@@ -2079,6 +2080,11 @@ def create_app(*, admin_token: str | None = None, db_path: Path | None = None, d
     def emergency_stop(x_admin_token: str | None = Header(default=None), x_session_token: str | None = Header(default=None)):
         actor = require_admin(x_admin_token, x_session_token)
         app.state.emergency_stop = True
+        conn.execute(
+            "INSERT INTO settings (key, value) VALUES ('emergency_stop', 'true') "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value"
+        )
+        conn.commit()
         notify_tasks()
         audit(actor, "", "emergency_stop", {}, "allowed")
         alertsmod.dispatch_alert("emergency_stop", "critical", "EMERGENCY STOP ACTIVATED", {"actor": actor})
@@ -2088,6 +2094,11 @@ def create_app(*, admin_token: str | None = None, db_path: Path | None = None, d
     def emergency_clear(x_admin_token: str | None = Header(default=None), x_session_token: str | None = Header(default=None)):
         require_admin(x_admin_token, x_session_token)
         app.state.emergency_stop = False
+        conn.execute(
+            "INSERT INTO settings (key, value) VALUES ('emergency_stop', 'false') "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value"
+        )
+        conn.commit()
         notify_tasks()
         audit("admin", "", "emergency_stop_clear", {}, "allowed")
         return {"emergency_stop": False}
@@ -3729,7 +3740,7 @@ def create_app(*, admin_token: str | None = None, db_path: Path | None = None, d
 
         if oidcmod.oidc_config() is None:
             raise HTTPException(status_code=400, detail="OIDC is not configured.")
-        url, _, _ = oidcmod.new_login()
+        url, _, _ = oidcmod.new_login(conn)
         return RedirectResponse(url, status_code=302)
 
     @app.get("/api/auth/oidc/callback")
@@ -3742,7 +3753,7 @@ def create_app(*, admin_token: str | None = None, db_path: Path | None = None, d
         cfg = oidcmod.oidc_config()
         if cfg is None:
             raise HTTPException(status_code=400, detail="OIDC is not configured.")
-        pending = oidcmod.pop_pending(state)
+        pending = oidcmod.pop_pending(conn, state)
         if pending is None or not code:
             raise HTTPException(status_code=400, detail="Invalid or expired login attempt.")
         try:

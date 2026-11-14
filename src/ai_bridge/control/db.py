@@ -49,6 +49,8 @@ CREATE TABLE IF NOT EXISTS users (
 CREATE TABLE IF NOT EXISTS sessions (
   token_hash TEXT PRIMARY KEY, username TEXT NOT NULL, role TEXT NOT NULL,
   expires_at REAL NOT NULL, created_at REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS oidc_pending (
+  state TEXT PRIMARY KEY, nonce TEXT NOT NULL, created_at REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS policies (
   id INTEGER PRIMARY KEY AUTOINCREMENT, version INTEGER NOT NULL,
   policy_json TEXT NOT NULL, created_by TEXT, created_at REAL NOT NULL, note TEXT);

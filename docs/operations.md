@@ -3,7 +3,8 @@
 - Logs: `journalctl -u ai-bridge-*`; audit via `GET /api/audit`.
 - Emergency stop: dashboard button or `POST /api/emergency-stop` (admin
   token). Clears with `POST /api/emergency-stop/clear`. While active,
-  new tasks are rejected (403) and agents report `emergency_stop: true`.
+  new tasks are rejected (403) and agents report `emergency_stop: true`. The
+  value is stored in the control database and remains active after restart.
 - Upgrades: `git fetch --tags && git checkout vX.Y.Z`, reinstall the venv,
   restart services, re-run `pytest -q`. Roll back the same way to the
   previous tag; the SQLite/Postgres schema is additive in v0.2.
@@ -14,9 +15,10 @@
   anonymous IPs on general API paths; authentication flows have separate limits.
   Redis can share limits between processes. Keep proxy-level limiting and
   per-tenant quotas in front of public deployments.
-- The production control API runs one worker while background schedulers and
-  emergency-stop/OIDC pending state are process-local. Do not increase the
-  worker count until those components use shared durable coordination.
+- The production control API runs one worker because scheduler ownership and
+  several locks remain process-local. Emergency-stop and single-use OIDC state
+  are now database-backed, but emergency-stop changes are not broadcast to
+  concurrently running workers. Do not increase the worker count yet.
 - PostgreSQL deployments install `requirements-postgres.txt`. Tune
   `AI_BRIDGE_PG_POOL_MIN_SIZE`, `AI_BRIDGE_PG_POOL_MAX_SIZE` and
   `AI_BRIDGE_PG_POOL_WAIT_S` for the deployment; execute the PostgreSQL

@@ -50,9 +50,11 @@ that platform path has been exercised or production-ready.
   the PostgreSQL integration suite and connection-pool behavior are verified.
 - Reverse-proxy mTLS is optional deployment configuration. The control plane
   does not itself terminate client-certificate authentication.
-- Emergency-stop, OIDC pending state and background schedulers include
-  process-local state. Use one worker until shared durable coordination and
-  restart behavior are implemented and tested.
+- Emergency-stop state and single-use OIDC login state are persisted in the
+  database and survive process restarts. The emergency-stop value is loaded at
+  startup; live cross-worker updates are not coordinated. Background schedulers
+  and other locks remain process-local, so use one worker until shared scheduler
+  ownership and multi-worker state propagation are implemented.
 - Browser sessions require distinct bearer tokens for distinct principals.
   Browser egress policy is defense in depth; production deployments handling
   untrusted pages should also restrict outbound network access at the host or

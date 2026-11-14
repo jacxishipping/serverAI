@@ -117,6 +117,31 @@ def test_admin_terminal_transition_records_event_and_fails_dependents(tmp_path):
     assert events[-1]["event_type"] == "admin_updated"
 
 
+def test_emergency_stop_survives_control_plane_restart(tmp_path):
+    db_path = tmp_path / "emergency-stop.db"
+    first = TestClient(create_app(admin_token=ADMIN, db_path=db_path))
+    activated = first.post("/api/emergency-stop", headers={"X-Admin-Token": ADMIN})
+    assert activated.status_code == 200
+
+    restarted = TestClient(create_app(admin_token=ADMIN, db_path=db_path))
+    assert restarted.get("/health", headers={"X-Admin-Token": ADMIN}).json()["emergency_stop"] is True
+    enrolled = restarted.post(
+        "/api/devices/enroll",
+        json={"name": "stopped-device", "hostname": "host", "os": "linux"},
+        headers={"X-Admin-Token": ADMIN},
+    ).json()
+    rejected = restarted.post(
+        "/api/tasks",
+        json={"device_id": enrolled["device_id"], "tool": "get_system_info"},
+        headers={"X-Admin-Token": ADMIN},
+    )
+    assert rejected.status_code == 403
+    cleared = restarted.post("/api/emergency-stop/clear", headers={"X-Admin-Token": ADMIN})
+    assert cleared.status_code == 200
+    third = TestClient(create_app(admin_token=ADMIN, db_path=db_path))
+    assert third.get("/health").json()["emergency_stop"] is False
+
+
 def test_restart_marks_running_task_for_operator_review(tmp_path):
     db_path = tmp_path / "restart.db"
     first = TestClient(create_app(admin_token=ADMIN, db_path=db_path))
