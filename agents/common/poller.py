@@ -11,11 +11,13 @@ from __future__ import annotations
 import json
 import os
 import platform
+import shutil
 import sys
 import time
 import urllib.error
 import urllib.request
 from collections.abc import Callable
+from functools import lru_cache
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
@@ -27,6 +29,75 @@ from .spool import TaskSpooler
 
 MAX_RESULT_CHARS = 512_000
 ROTATE_THRESHOLD_SECONDS = 2 * 86400  # Rotate when < 48h remaining
+INVENTORY_SCHEMA_VERSION = 1
+INVENTORY_TOOL_NAMES = (
+    "git", "python", "python3", "node", "npm", "docker", "podman", "kubectl",
+    "terraform", "ansible", "powershell", "pwsh", "ssh",
+)
+
+
+@lru_cache(maxsize=1)
+def _collect_installed_apps() -> list[dict[str, str]]:
+    """Collect a bounded, name-only list from standard desktop app locations."""
+    apps: dict[str, str] = {}
+    try:
+        system = platform.system().lower()
+        if system == "windows":
+            import winreg
+
+            locations = (
+                (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"),
+                (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall"),
+                (winreg.HKEY_CURRENT_USER, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"),
+            )
+            for hive, path in locations:
+                try:
+                    with winreg.OpenKey(hive, path) as root:
+                        for index in range(winreg.QueryInfoKey(root)[0]):
+                            try:
+                                with winreg.OpenKey(root, winreg.EnumKey(root, index)) as entry:
+                                    name = winreg.QueryValueEx(entry, "DisplayName")[0]
+                                if isinstance(name, str) and name.strip():
+                                    apps[name.strip()[:160]] = "windows_uninstall_registry"
+                            except OSError:
+                                continue
+                except OSError:
+                    continue
+        else:
+            roots = [Path("/Applications"), Path.home() / "Applications"]
+            if system == "linux":
+                roots.extend((Path("/usr/share/applications"), Path.home() / ".local/share/applications"))
+            for root in roots:
+                try:
+                    for path in root.iterdir():
+                        if path.suffix.lower() == ".app" or (system == "linux" and path.suffix.lower() == ".desktop"):
+                            apps[path.stem[:160]] = "standard_application_directory"
+                except OSError:
+                    continue
+    except Exception:
+        # Inventory is optional telemetry; the heartbeat itself must remain available.
+        return []
+    return [{"name": name, "source": source} for name, source in sorted(apps.items(), key=lambda item: item[0].casefold())[:100]]
+
+
+def _collect_inventory() -> dict:
+    installed_tools = sorted(name for name in INVENTORY_TOOL_NAMES if shutil.which(name))
+    system = platform.system().lower()
+    capabilities = ["task.polling", "telemetry.system_metrics", "inventory.installed_apps", "inventory.installed_tools"]
+    if system in {"windows", "darwin", "linux"}:
+        capabilities.extend(("desktop.capture", "desktop.input"))
+    return {
+        "schema_version": INVENTORY_SCHEMA_VERSION,
+        "runtime": {
+            "python": platform.python_version(),
+            "machine": platform.machine(),
+            "system": platform.system(),
+            "release": platform.release(),
+        },
+        "capabilities": sorted(capabilities),
+        "installed_tools": installed_tools,
+        "installed_apps": _collect_installed_apps(),
+    }
 
 
 def _collect_metrics() -> dict:
@@ -174,19 +245,13 @@ class Poller:
         return self.device_token
 
     def heartbeat(self) -> dict:
+        inventory = _collect_inventory()
         hb_body = {
             "hostname": platform.node(),
             "os": f"{platform.system()} {platform.release()}".strip(),
             "metrics": _collect_metrics(),
-            "capabilities": ["task.polling", "telemetry.system_metrics"],
-            "inventory": {
-                "runtime": {
-                    "python": platform.python_version(),
-                    "machine": platform.machine(),
-                    "system": platform.system(),
-                    "release": platform.release(),
-                }
-            },
+            "capabilities": inventory["capabilities"],
+            "inventory": inventory,
         }
         try:
             hb = self._req("POST", "/api/agent/heartbeat", hb_body)

@@ -36,9 +36,12 @@ that platform path has been exercised or production-ready.
   for operator review rather than replayed. Project memory APIs record source,
   optional same-tenant task evidence and expiry; custom agents with a matching
   project ID load bounded, unexpired entries into their system context.
-- Heartbeats can persist a bounded device capability list and inventory object;
-  the shared Python poller reports basic runtime and resource telemetry. A full
-  installed-application inventory and native-agent parity contract remain open.
+- Heartbeats persist a bounded device capability list and inventory object. The
+  shared Python poller now sends schema version 1, runtime identity, advertised
+  desktop/task/telemetry capabilities, allowlisted installed tool names, and up
+  to 100 application names discovered from standard OS locations. This is a
+  best-effort Python-agent contract; native-agent parity and host validation
+  remain open.
 
 ## Validation boundaries
 
