@@ -34,3 +34,41 @@ jobs:
           name: dashboard-browser-failures
           path: apps/dashboard/test-results/
           retention-days: 7
+
+  postgres:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: aibridge_test
+          POSTGRES_USER: aibridge
+          POSTGRES_PASSWORD: aibridge-test-only
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U aibridge -d aibridge_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      AI_BRIDGE_TEST_POSTGRES_URL: postgresql://aibridge:aibridge-test-only@localhost:5432/aibridge_test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install -e ".[dev,postgres]"
+      - run: pytest -v tests/integration/test_postgres_runtime.py
+
+  native-agent-smoke:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install -e ".[dev]"
+      - run: pytest -q tests/test_windows_v1_architecture.py tests/test_windows_v2_architecture.py tests/unit/test_windows_app_runtime.py tests/unit/test_windows_diagnose.py

@@ -26,13 +26,14 @@ CREATE TABLE IF NOT EXISTS devices (
   id TEXT PRIMARY KEY, name TEXT NOT NULL, hostname TEXT, os TEXT,
   tenant TEXT NOT NULL DEFAULT 'default', token_hash TEXT NOT NULL,
   status TEXT NOT NULL DEFAULT 'offline', last_seen REAL,
-  policy_json TEXT NOT NULL DEFAULT '{}', revoked INTEGER NOT NULL DEFAULT 0,
+  policy_json TEXT NOT NULL DEFAULT '{}', capabilities_json TEXT NOT NULL DEFAULT '[]',
+  inventory_json TEXT NOT NULL DEFAULT '{}', revoked INTEGER NOT NULL DEFAULT 0,
   created_at REAL NOT NULL, token_expires_at REAL, token_issued_at REAL);
 CREATE TABLE IF NOT EXISTS tasks (
   id TEXT PRIMARY KEY, device_id TEXT NOT NULL, tenant TEXT NOT NULL DEFAULT 'default',
   tool TEXT NOT NULL, args_json TEXT NOT NULL DEFAULT '{}', tier INTEGER,
   status TEXT NOT NULL DEFAULT 'queued', result TEXT DEFAULT '',
-  approval_id TEXT, created_at REAL NOT NULL, updated_at REAL NOT NULL);
+  approval_id TEXT, checkpoint_json TEXT NOT NULL DEFAULT '{}', created_at REAL NOT NULL, updated_at REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS approvals (
   id TEXT PRIMARY KEY, task_id TEXT, tool TEXT, reason TEXT,
   status TEXT NOT NULL DEFAULT 'pending', created_at REAL NOT NULL, decided_by TEXT,
@@ -94,6 +95,7 @@ CREATE TABLE IF NOT EXISTS custom_agents (
   name TEXT NOT NULL,
   instruction TEXT NOT NULL,
   tenant TEXT NOT NULL DEFAULT 'default',
+  project_id TEXT,
   provider TEXT NOT NULL DEFAULT 'openai',
   model TEXT,
   base_url TEXT,
@@ -155,6 +157,14 @@ CREATE TABLE IF NOT EXISTS agent_runs (
   response TEXT DEFAULT '',
   steps_json TEXT NOT NULL DEFAULT '[]',
   error TEXT DEFAULT '');
+CREATE TABLE IF NOT EXISTS project_memories (
+  id TEXT PRIMARY KEY, tenant TEXT NOT NULL DEFAULT 'default', project_id TEXT NOT NULL,
+  title TEXT NOT NULL, content TEXT NOT NULL, source TEXT NOT NULL,
+  source_task_id TEXT, created_by TEXT NOT NULL, created_at REAL NOT NULL,
+  expires_at REAL
+);
+CREATE INDEX IF NOT EXISTS idx_project_memories_lookup
+  ON project_memories(tenant, project_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_custom_agents_due ON custom_agents(enabled, next_run_at);
 CREATE INDEX IF NOT EXISTS idx_agent_runs_agent ON agent_runs(agent_id, started_at DESC);
 CREATE TABLE IF NOT EXISTS workflow_templates (
@@ -296,75 +306,124 @@ class LockedConnection:
 
 
 class PostgresConnection:
-    """Thread-safe connection wrapper for PostgreSQL using psycopg."""
+    """PostgreSQL wrapper with thread-local transactions over a bounded pool."""
 
     def __init__(self, dsn: str):
-        import psycopg
         self.dsn = dsn
-        self._conn = psycopg.connect(dsn, autocommit=False)
-        self._lock = threading.RLock()
+        from psycopg_pool import ConnectionPool
+
+        min_size = max(1, int(os.environ.get("AI_BRIDGE_PG_POOL_MIN_SIZE", "1")))
+        max_size = max(min_size, int(os.environ.get("AI_BRIDGE_PG_POOL_MAX_SIZE", "10")))
+        self._pool = ConnectionPool(
+            conninfo=dsn,
+            min_size=min_size,
+            max_size=max_size,
+            kwargs={"autocommit": False},
+            open=True,
+        )
+        self._local = threading.local()
         self.dialect = "postgres"
+
+    def _checkout(self) -> Any:
+        conn = getattr(self._local, "conn", None)
+        if conn is None:
+            timeout = max(0.1, float(os.environ.get("AI_BRIDGE_PG_POOL_WAIT_S", "10")))
+            conn = self._pool.getconn(timeout=timeout)
+            self._local.conn = conn
+            self._local.dirty = False
+        return conn
+
+    def _release(self, *, rollback: bool = False) -> None:
+        conn = getattr(self._local, "conn", None)
+        if conn is None:
+            return
+        try:
+            if rollback:
+                conn.rollback()
+            elif getattr(self._local, "dirty", False):
+                conn.commit()
+            else:
+                # End the implicit read transaction before returning to pool.
+                conn.rollback()
+        finally:
+            self._pool.putconn(conn)
+            self._local.conn = None
+            self._local.dirty = False
 
     @contextlib.contextmanager
     def transaction(self):
-        with self._lock:
-            try:
-                yield self
-                self._conn.commit()
-            except Exception:
-                self._conn.rollback()
-                raise
-
-    def _ensure_conn(self) -> None:
-        if getattr(self._conn, "closed", False):
-            import psycopg
-            self._conn = psycopg.connect(self.dsn, autocommit=False)
+        conn = self._checkout()
+        depth = getattr(self._local, "transaction_depth", 0)
+        self._local.transaction_depth = depth + 1
+        try:
+            yield self
+            if depth == 0:
+                conn.commit()
+                self._local.dirty = False
+        except Exception:
+            conn.rollback()
+            self._local.dirty = False
+            raise
+        finally:
+            self._local.transaction_depth = depth
+            if depth == 0:
+                self._release(rollback=bool(getattr(self._local, "dirty", False)))
 
     def execute(self, sql: str, parameters: tuple | list = ()) -> _LockedResult:
-        with self._lock:
-            self._ensure_conn()
-            pg_sql = to_pg_sql(sql)
-            cur = self._conn.cursor()
-            try:
-                cur.execute(pg_sql, parameters)
-                if cur.description:
-                    cols = [desc[0] for desc in cur.description]
-                    raw_rows = cur.fetchall()
-                    rows = [RowDict(dict(zip(cols, r)), cols) for r in raw_rows]
-                else:
-                    rows = []
-                return _LockedResult(rows, cur.rowcount, getattr(cur, "lastrowid", None))
-            except Exception:
-                with contextlib.suppress(Exception):
-                    self._conn.rollback()
-                raise
+        conn = self._checkout()
+        pg_sql = to_pg_sql(sql)
+        command = sql.lstrip().split(None, 1)[0].upper() if sql.strip() else ""
+        read_only = command in {"SELECT", "SHOW", "EXPLAIN"}
+        cur = conn.cursor()
+        try:
+            cur.execute(pg_sql, parameters)
+            if cur.description:
+                cols = [desc[0] for desc in cur.description]
+                raw_rows = cur.fetchall()
+                rows = [RowDict(dict(zip(cols, r)), cols) for r in raw_rows]
+            else:
+                rows = []
+            if not read_only:
+                self._local.dirty = True
+            result = _LockedResult(rows, cur.rowcount, getattr(cur, "lastrowid", None))
+            if read_only and not self._local.dirty and getattr(self._local, "transaction_depth", 0) == 0:
+                self._release()
+            return result
+        except Exception:
+            self._release(rollback=True)
+            raise
 
     def executescript(self, sql_script: str):
-        with self._lock:
-            self._ensure_conn()
-            cur = self._conn.cursor()
-            try:
-                for stmt in sql_script.split(";"):
-                    s = stmt.strip()
-                    if s:
-                        cur.execute(s)
-                self._conn.commit()
-            except Exception:
-                with contextlib.suppress(Exception):
-                    self._conn.rollback()
-                raise
+        with self.transaction():
+            conn = self._checkout()
+            cur = conn.cursor()
+            for stmt in sql_script.split(";"):
+                s = stmt.strip()
+                if s:
+                    cur.execute(s)
+                    self._local.dirty = True
 
     def commit(self) -> None:
-        with self._lock:
-            self._conn.commit()
+        conn = getattr(self._local, "conn", None)
+        if conn is None:
+            return
+        conn.commit()
+        self._local.dirty = False
+        if getattr(self._local, "transaction_depth", 0) == 0:
+            self._release()
 
     def rollback(self) -> None:
-        with self._lock:
-            self._conn.rollback()
+        conn = getattr(self._local, "conn", None)
+        if conn is None:
+            return
+        conn.rollback()
+        self._local.dirty = False
+        if getattr(self._local, "transaction_depth", 0) == 0:
+            self._release()
 
     def close(self) -> None:
-        with self._lock:
-            self._conn.close()
+        self._release(rollback=True)
+        self._pool.close()
 
 
 def connect(db_path: Path | None = None, database_url: str | None = None) -> LockedConnection | PostgresConnection:

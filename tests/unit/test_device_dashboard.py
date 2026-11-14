@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -82,6 +83,7 @@ def test_overview_with_completed_telemetry_tasks(dash_setup):
     q1 = client.post("/api/tasks", json={"device_id": device_id, "tool": "get_system_info", "args": {}}, headers={"X-Admin-Token": "adm-secret"})
     assert q1.status_code == 200
     t1_id = q1.json()["task_id"]
+    assert client.get("/api/agent/tasks/next", headers={"X-Device-Token": device_token}).json()["task"]["id"] == t1_id
     client.post(
         f"/api/agent/tasks/{t1_id}/result",
         json={"status": "completed", "result": json.dumps({
@@ -98,6 +100,7 @@ def test_overview_with_completed_telemetry_tasks(dash_setup):
     # 2. Queue get_resource_usage and report result
     q2 = client.post("/api/tasks", json={"device_id": device_id, "tool": "get_resource_usage", "args": {}}, headers={"X-Admin-Token": "adm-secret"})
     t2_id = q2.json()["task_id"]
+    assert client.get("/api/agent/tasks/next", headers={"X-Device-Token": device_token}).json()["task"]["id"] == t2_id
     client.post(
         f"/api/agent/tasks/{t2_id}/result",
         json={"status": "completed", "result": json.dumps({
@@ -115,6 +118,7 @@ def test_overview_with_completed_telemetry_tasks(dash_setup):
     # 3. Queue list_processes and report result
     q3 = client.post("/api/tasks", json={"device_id": device_id, "tool": "list_processes", "args": {}}, headers={"X-Admin-Token": "adm-secret"})
     t3_id = q3.json()["task_id"]
+    assert client.get("/api/agent/tasks/next", headers={"X-Device-Token": device_token}).json()["task"]["id"] == t3_id
     client.post(
         f"/api/agent/tasks/{t3_id}/result",
         json={"status": "completed", "result": json.dumps([
@@ -128,6 +132,7 @@ def test_overview_with_completed_telemetry_tasks(dash_setup):
     # 4. Queue list_docker_containers and report result
     q4 = client.post("/api/tasks", json={"device_id": device_id, "tool": "list_docker_containers", "args": {}}, headers={"X-Admin-Token": "adm-secret"})
     t4_id = q4.json()["task_id"]
+    assert client.get("/api/agent/tasks/next", headers={"X-Device-Token": device_token}).json()["task"]["id"] == t4_id
     client.post(
         f"/api/agent/tasks/{t4_id}/result",
         json={"status": "completed", "result": json.dumps({
@@ -142,6 +147,7 @@ def test_overview_with_completed_telemetry_tasks(dash_setup):
     # 5. Queue get_network_info and report result
     q5 = client.post("/api/tasks", json={"device_id": device_id, "tool": "get_network_info", "args": {}}, headers={"X-Admin-Token": "adm-secret"})
     t5_id = q5.json()["task_id"]
+    assert client.get("/api/agent/tasks/next", headers={"X-Device-Token": device_token}).json()["task"]["id"] == t5_id
     client.post(
         f"/api/agent/tasks/{t5_id}/result",
         json={"status": "completed", "result": json.dumps({

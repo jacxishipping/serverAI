@@ -44,7 +44,9 @@ def generate_ephemeral_turn_credentials(
     secret: str | None = None,
 ) -> list[dict[str, Any]]:
     """Generate RFC 5766 / REST API ephemeral TURN credentials using HMAC-SHA1 for symmetric NAT traversal."""
-    turn_secret = secret or os.environ.get("AI_BRIDGE_TURN_SECRET", "aibridge_turn_shared_secret_2026")
+    turn_secret = secret or os.environ.get("AI_BRIDGE_TURN_SECRET", "")
+    if not turn_secret:
+        raise RuntimeError("AI_BRIDGE_TURN_SECRET is required to generate TURN credentials.")
     host = turn_host or os.environ.get("AI_BRIDGE_TURN_HOST", "jxiptvplayer.app")
     expiry = int(time.time()) + ttl_seconds
     username = f"{expiry}:{username_prefix}"
@@ -117,6 +119,7 @@ def release_all_held_keys() -> int:
     if keys and platform.system() == "Windows":
         try:
             import ctypes
+
             from ai_bridge.tools import _vk_for_token
 
             u = ctypes.windll.user32
@@ -211,6 +214,7 @@ class ScreenTrack:
 
     def __new__(cls, *args, **kwargs):
         import fractions
+
         from aiortc import VideoStreamTrack
 
         class _Track(VideoStreamTrack):
@@ -261,6 +265,12 @@ class ScreenTrack:
                     img = await asyncio.to_thread(grab_screen, self._scale, self._monitor_index)
                 except Exception as exc:
                     self._dropped_frames += 1
+                    try:
+                        from ai_bridge.control.metrics import record_webrtc_frame
+
+                        record_webrtc_frame(dropped=True)
+                    except Exception:
+                        pass
                     raise RuntimeError(f"Desktop capture unavailable: {exc}") from exc
                 t_cap_end = time.perf_counter()
                 capture_ms = (t_cap_end - t_cap_start) * 1000.0
@@ -271,6 +281,12 @@ class ScreenTrack:
                 frame.time_base = time_base
                 t_enc_end = time.perf_counter()
                 prep_ms = (t_enc_end - t_enc_start) * 1000.0
+                try:
+                    from ai_bridge.control.metrics import record_webrtc_frame
+
+                    record_webrtc_frame(capture_seconds=capture_ms / 1000.0, prep_seconds=prep_ms / 1000.0)
+                except Exception:
+                    pass
 
                 self._frames_sent += 1
                 self._window_frames += 1
@@ -312,6 +328,7 @@ class DesktopAudioTrack:
 
     def __new__(cls, *args, **kwargs):
         import fractions
+
         from aiortc import AudioStreamTrack
 
         class _AudioTrack(AudioStreamTrack):

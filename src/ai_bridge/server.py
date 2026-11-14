@@ -41,7 +41,7 @@ from .device_routing import (
 )
 from .execution import RUNNER
 from .policy import TOOL_TIERS
-from .security import is_secret_name, read_workspace_text, redact
+from .security import read_workspace_text
 
 # Local approval store: approvals are created via request_approval and
 # granted only by approve_task with the admin token (hmac compare) or by
@@ -111,6 +111,27 @@ def _session_key() -> str:
     if not tok:
         return "default"
     return hashlib.sha256(tok.encode()).hexdigest()[:16]
+
+
+def _browser_principal() -> str:
+    """Stable browser isolation key; unauthenticated HTTP must not share a profile."""
+    try:
+        ctx = mcp.get_context()
+        req = getattr(getattr(ctx, "request_context", None), "request", None)
+    except Exception:
+        req = None
+    if req is None:
+        return f"stdio:{os.getpid()}"
+    token = _bearer_token()
+    if not token:
+        raise PermissionError("Browser tools require an authenticated bearer token over HTTP.")
+    return "principal:" + hashlib.sha256(token.encode()).hexdigest()
+
+
+def _browser_approval(tool_name: str) -> bool:
+    # Validate HTTP identity before consuming a one-time local approval.
+    _browser_principal()
+    return _consume_local_approval(tool_name)
 
 
 def _oauth_bound_device() -> str | None:
@@ -1333,16 +1354,16 @@ def browser_navigate(url: str, wait_until: str = "networkidle", timeout: int = 3
     url: Target URL (must be http:// or https://).
     wait_until: When to consider navigation complete ('load', 'domcontentloaded', 'networkidle').
     timeout: Maximum seconds to wait for navigation."""
-    approved = _consume_local_approval("browser_navigate")
-    return browser_tools.browser_navigate(url, wait_until=wait_until, timeout=timeout, approval_granted=approved)
+    approved = _browser_approval("browser_navigate")
+    return browser_tools.browser_navigate(url, wait_until=wait_until, timeout=timeout, approval_granted=approved, session_id=_browser_principal())
 
 
 @mcp.tool()
 def browser_screenshot(full_page: bool = False) -> dict:
     """Capture a screenshot of the current browser page.
     full_page: When True, captures the entire scrollable page instead of just the viewport."""
-    approved = _consume_local_approval("browser_screenshot")
-    return browser_tools.browser_screenshot(full_page=full_page, approval_granted=approved)
+    approved = _browser_approval("browser_screenshot")
+    return browser_tools.browser_screenshot(full_page=full_page, approval_granted=approved, session_id=_browser_principal())
 
 
 @mcp.tool()
@@ -1351,8 +1372,8 @@ def browser_click(selector: str, button: str = "left", clicks: int = 1) -> dict:
     selector: CSS selector (e.g. 'button#submit', '.nav-link').
     button: 'left', 'right', or 'middle'.
     clicks: Number of clicks (1 for single, 2 for double)."""
-    approved = _consume_local_approval("browser_click")
-    return browser_tools.browser_click(selector, button=button, clicks=clicks, approval_granted=approved)
+    approved = _browser_approval("browser_click")
+    return browser_tools.browser_click(selector, button=button, clicks=clicks, approval_granted=approved, session_id=_browser_principal())
 
 
 @mcp.tool()
@@ -1362,45 +1383,45 @@ def browser_type(selector: str, text: str, clear_first: bool = True, submit: boo
     text: Text to type.
     clear_first: Clear existing content before typing.
     submit: Press Enter after typing."""
-    approved = _consume_local_approval("browser_type")
-    return browser_tools.browser_type(selector, text, clear_first=clear_first, submit=submit, approval_granted=approved)
+    approved = _browser_approval("browser_type")
+    return browser_tools.browser_type(selector, text, clear_first=clear_first, submit=submit, approval_granted=approved, session_id=_browser_principal())
 
 
 @mcp.tool()
 def browser_get_text(selector: str = "body") -> dict:
     """Extract visible text content from elements matching a CSS selector.
     selector: CSS selector (default 'body' for full page text)."""
-    approved = _consume_local_approval("browser_get_text")
-    return browser_tools.browser_get_text(selector, approval_granted=approved)
+    approved = _browser_approval("browser_get_text")
+    return browser_tools.browser_get_text(selector, approval_granted=approved, session_id=_browser_principal())
 
 
 @mcp.tool()
 def browser_evaluate(script: str) -> dict:
     """Execute JavaScript in the current page context and return the result.
     script: JavaScript code to execute. Use 'return' to yield a value."""
-    approved = _consume_local_approval("browser_evaluate")
-    return browser_tools.browser_evaluate(script, approval_granted=approved)
+    approved = _browser_approval("browser_evaluate")
+    return browser_tools.browser_evaluate(script, approval_granted=approved, session_id=_browser_principal())
 
 
 @mcp.tool()
 def browser_get_url() -> dict:
     """Return the current page URL and title."""
-    approved = _consume_local_approval("browser_get_url")
-    return browser_tools.browser_get_url(approval_granted=approved)
+    approved = _browser_approval("browser_get_url")
+    return browser_tools.browser_get_url(approval_granted=approved, session_id=_browser_principal())
 
 
 @mcp.tool()
 def browser_go_back() -> dict:
     """Navigate back in browser history."""
-    approved = _consume_local_approval("browser_go_back")
-    return browser_tools.browser_go_back(approval_granted=approved)
+    approved = _browser_approval("browser_go_back")
+    return browser_tools.browser_go_back(approval_granted=approved, session_id=_browser_principal())
 
 
 @mcp.tool()
 def browser_go_forward() -> dict:
     """Navigate forward in browser history."""
-    approved = _consume_local_approval("browser_go_forward")
-    return browser_tools.browser_go_forward(approval_granted=approved)
+    approved = _browser_approval("browser_go_forward")
+    return browser_tools.browser_go_forward(approval_granted=approved, session_id=_browser_principal())
 
 
 @mcp.tool()
@@ -1408,23 +1429,23 @@ def browser_scroll(delta_y: int = 0, delta_x: int = 0) -> dict:
     """Scroll the current page by delta pixels.
     delta_y: Vertical scroll amount (positive = down, negative = up).
     delta_x: Horizontal scroll amount (positive = right, negative = left)."""
-    approved = _consume_local_approval("browser_scroll")
-    return browser_tools.browser_scroll(delta_y=delta_y, delta_x=delta_x, approval_granted=approved)
+    approved = _browser_approval("browser_scroll")
+    return browser_tools.browser_scroll(delta_y=delta_y, delta_x=delta_x, approval_granted=approved, session_id=_browser_principal())
 
 
 @mcp.tool()
 def browser_close() -> dict:
     """Close the browser and release all resources."""
-    approved = _consume_local_approval("browser_close")
-    return browser_tools.browser_close(approval_granted=approved)
+    approved = _browser_approval("browser_close")
+    return browser_tools.browser_close(approval_granted=approved, session_id=_browser_principal())
 
 
 @mcp.tool()
 def browser_new_page(url: str | None = None) -> dict:
     """Open a new browser tab. Optionally navigate to a URL.
     url: Optional URL to navigate the new tab to."""
-    approved = _consume_local_approval("browser_new_page")
-    return browser_tools.browser_new_page(url=url, approval_granted=approved)
+    approved = _browser_approval("browser_new_page")
+    return browser_tools.browser_new_page(url=url, approval_granted=approved, session_id=_browser_principal())
 
 
 @mcp.tool()
@@ -1432,8 +1453,8 @@ def browser_get_elements(selector: str, include_text: bool = True) -> dict:
     """List elements matching a CSS selector with tag names, counts, and optional text snippets.
     selector: CSS selector to query.
     include_text: Include visible text for each matched element."""
-    approved = _consume_local_approval("browser_get_elements")
-    return browser_tools.browser_get_elements(selector, include_text=include_text, approval_granted=approved)
+    approved = _browser_approval("browser_get_elements")
+    return browser_tools.browser_get_elements(selector, include_text=include_text, approval_granted=approved, session_id=_browser_principal())
 
 
 @mcp.tool()
@@ -1442,8 +1463,8 @@ def browser_wait_for_selector(selector: str, timeout: int = 10, state: str = "vi
     selector: CSS selector to wait for.
     timeout: Maximum seconds to wait.
     state: 'visible', 'hidden', 'attached', or 'detached'."""
-    approved = _consume_local_approval("browser_wait_for_selector")
-    return browser_tools.browser_wait_for_selector(selector, timeout=timeout, state=state, approval_granted=approved)
+    approved = _browser_approval("browser_wait_for_selector")
+    return browser_tools.browser_wait_for_selector(selector, timeout=timeout, state=state, approval_granted=approved, session_id=_browser_principal())
 
 
 @mcp.tool()
@@ -1452,8 +1473,8 @@ def browser_select_option(selector: str, value: str | None = None, label: str | 
     selector: CSS selector for the <select> element.
     value: Option value attribute to select.
     label: Visible text of the option to select."""
-    approved = _consume_local_approval("browser_select_option")
-    return browser_tools.browser_select_option(selector, value=value, label=label, approval_granted=approved)
+    approved = _browser_approval("browser_select_option")
+    return browser_tools.browser_select_option(selector, value=value, label=label, approval_granted=approved, session_id=_browser_principal())
 
 
 @mcp.tool()
@@ -1461,8 +1482,8 @@ def browser_download_file(url: str, filename: str | None = None) -> dict:
     """Download a file via the browser context to the workspace data directory.
     url: Direct URL of the file to download.
     filename: Optional filename override (defaults to URL basename)."""
-    approved = _consume_local_approval("browser_download_file")
-    return browser_tools.browser_download_file(url, filename=filename, approval_granted=approved)
+    approved = _browser_approval("browser_download_file")
+    return browser_tools.browser_download_file(url, filename=filename, approval_granted=approved, session_id=_browser_principal())
 
 
 class _BearerAuthMiddleware:
