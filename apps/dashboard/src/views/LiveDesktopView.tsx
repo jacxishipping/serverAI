@@ -174,15 +174,19 @@ export const LiveDesktopView: React.FC = () => {
   const [webrtcConnected, setWebrtcConnected] = useState<boolean>(false);
   const [webrtcStats, setWebrtcStats] = useState<{
     fps: number;
+    renderFps: number;
     bitrateMbps: number;
     rttMs: number;
     droppedFrames: number;
+    renderDelayMs: number;
     state: string;
   }>({
-    fps: 30,
-    bitrateMbps: 4.5,
-    rttMs: 12,
+    fps: 0,
+    renderFps: 0,
+    bitrateMbps: 0,
+    rttMs: 0,
     droppedFrames: 0,
+    renderDelayMs: 0,
     state: "idle",
   });
 
@@ -217,11 +221,15 @@ export const LiveDesktopView: React.FC = () => {
   const inputDcRef = useRef<RTCDataChannel | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
   const prevBytesRef = useRef<{ bytes: number; ts: number }>({ bytes: 0, ts: 0 });
+  const prevPacketCountsRef = useRef<{ lost: number; received: number }>({ lost: 0, received: 0 });
   const inputSeqRef = useRef<number>(1);
   const mediaStreamRef = useRef<MediaStream | null>(null);
   const webrtcConnectedRef = useRef<boolean>(false);
   const lastCoordUpdateRef = useRef<number>(0);
   const cleanupWebrtcRef = useRef<() => void>(() => {});
+  const renderFrameCountRef = useRef<number>(0);
+  const renderDelayRef = useRef<number>(0);
+  const reconnectingRef = useRef<boolean>(false);
 
   webrtcConnectedRef.current = webrtcConnected;
 
@@ -237,6 +245,27 @@ export const LiveDesktopView: React.FC = () => {
       }
     }
   });
+
+  // Measure frames delivered to the compositor, separately from frames decoded by WebRTC.
+  useEffect(() => {
+    const video = videoRef.current;
+    if (!video || typeof video.requestVideoFrameCallback !== "function") return;
+    let active = true;
+    let callbackId = 0;
+    const onFrame: VideoFrameRequestCallback = (_now, metadata) => {
+      if (!active) return;
+      renderFrameCountRef.current += 1;
+      if (Number.isFinite(metadata.expectedDisplayTime) && Number.isFinite(metadata.presentationTime)) {
+        renderDelayRef.current = Math.max(0, metadata.expectedDisplayTime - metadata.presentationTime);
+      }
+      callbackId = video.requestVideoFrameCallback(onFrame);
+    };
+    callbackId = video.requestVideoFrameCallback(onFrame);
+    return () => {
+      active = false;
+      video.cancelVideoFrameCallback(callbackId);
+    };
+  }, []);
 
   const sendDataChannelEvent = useCallback((payload: Record<string, unknown>) => {
     const dc = inputDcRef.current;
@@ -1010,15 +1039,19 @@ export const LiveDesktopView: React.FC = () => {
       if (!pc) return;
       try {
         const report = await pc.getStats();
-        let fps = 30;
+        let fps = 0;
         let droppedFrames = 0;
         let bytesReceived = 0;
-        let rttMs = 12;
+        let rttMs = 0;
+        let packetsLost = 0;
+        let packetsReceived = 0;
         report.forEach((stat: any) => {
           if (stat.type === "inbound-rtp" && stat.kind === "video") {
             if (typeof stat.framesPerSecond === "number") fps = Math.round(stat.framesPerSecond);
             if (typeof stat.framesDropped === "number") droppedFrames = stat.framesDropped;
             if (typeof stat.bytesReceived === "number") bytesReceived = stat.bytesReceived;
+            if (typeof stat.packetsLost === "number") packetsLost = Math.max(0, stat.packetsLost);
+            if (typeof stat.packetsReceived === "number") packetsReceived = stat.packetsReceived;
           }
           if (stat.type === "candidate-pair" && stat.state === "succeeded") {
             if (typeof stat.currentRoundTripTime === "number") {
@@ -1026,8 +1059,12 @@ export const LiveDesktopView: React.FC = () => {
             }
           }
         });
+        const lostDelta = Math.max(0, packetsLost - prevPacketCountsRef.current.lost);
+        const receivedDelta = Math.max(0, packetsReceived - prevPacketCountsRef.current.received);
+        prevPacketCountsRef.current = { lost: packetsLost, received: packetsReceived };
+        const intervalLossPct = (lostDelta / Math.max(1, lostDelta + receivedDelta)) * 100;
         const now = performance.now();
-        let bitrateMbps = 4.5;
+        let bitrateMbps = 0;
         if (prevBytesRef.current.ts > 0 && bytesReceived > prevBytesRef.current.bytes) {
           const deltaSec = (now - prevBytesRef.current.ts) / 1000;
           if (deltaSec > 0) {
@@ -1037,12 +1074,14 @@ export const LiveDesktopView: React.FC = () => {
           }
         }
         prevBytesRef.current = { bytes: bytesReceived, ts: now };
+        const renderFps = renderFrameCountRef.current;
+        renderFrameCountRef.current = 0;
 
         // Closed-loop Adaptive Bitrate (ABR) algorithm
         if (abrMode === "auto") {
           const curr = currentBitrateRef.current;
-          const isCongested = rttMs > 160 || droppedFrames > 5;
-          const isClear = rttMs < 90 && droppedFrames === 0;
+          const isCongested = (rttMs > 160 && rttMs > 0) || droppedFrames > 5 || intervalLossPct > 3;
+          const isClear = rttMs > 0 && rttMs < 90 && droppedFrames === 0 && intervalLossPct === 0;
 
           if (isCongested) {
             consecutiveGoodRef.current = 0;
@@ -1071,18 +1110,20 @@ export const LiveDesktopView: React.FC = () => {
           }
         }
 
-        if (inputDcRef.current?.readyState === "open" && (rttMs > 160 || droppedFrames > 5)) {
+        if (inputDcRef.current?.readyState === "open" && ((rttMs > 160 && rttMs > 0) || droppedFrames > 5 || lostDelta > 0)) {
           sendDataChannelEvent({
             action: "network_quality",
             rtt_ms: rttMs,
-            packet_loss_pct: Math.min(100, Math.round((droppedFrames / Math.max(1, droppedFrames + fps)) * 100)),
+            packet_loss_pct: Math.min(100, Math.round(intervalLossPct)),
           });
         }
         setWebrtcStats({
-          fps,
+          fps: fps || renderFps,
+          renderFps,
           bitrateMbps,
           rttMs,
           droppedFrames,
+          renderDelayMs: Math.round(renderDelayRef.current),
           state: pc.connectionState || "connected",
         });
       } catch {
@@ -1262,6 +1303,7 @@ export const LiveDesktopView: React.FC = () => {
             setWebrtcStats((prev) => ({ ...prev, state: st }));
             if (st === "connected") {
               setIsReconnecting(false);
+              reconnectingRef.current = false;
               setWebrtcConnected(true);
               setRecentMacroNotice(`WebRTC live H.264 stream connected [${sid.slice(0, 8)}]`);
               setTimeout(() => setRecentMacroNotice(null), 3000);
@@ -1273,11 +1315,13 @@ export const LiveDesktopView: React.FC = () => {
                   setIsReconnecting(false);
                   setWebrtcConnected(false);
                   releaseAllRemoteKeys();
-                  if (isLiveMode()) {
+                  if (isLiveMode() && !reconnectingRef.current) {
+                    reconnectingRef.current = true;
                     void handleStartWebrtc();
                   }
                 } else if (pcRef.current?.connectionState === "connected") {
                   setIsReconnecting(false);
+                  reconnectingRef.current = false;
                 }
               }, 2500);
             } else if (st === "failed") {
@@ -1285,7 +1329,8 @@ export const LiveDesktopView: React.FC = () => {
               setWebrtcConnected(false);
               releaseAllRemoteKeys();
               setTimeout(() => {
-                if (isLiveMode()) {
+                if (isLiveMode() && !reconnectingRef.current) {
+                  reconnectingRef.current = true;
                   void handleStartWebrtc();
                 }
               }, 1500);
@@ -1311,6 +1356,8 @@ export const LiveDesktopView: React.FC = () => {
         }
       }
     } catch (err: any) {
+      reconnectingRef.current = false;
+      setIsReconnecting(false);
       setRecentMacroNotice(err?.message || "Could not start WebRTC session");
       setTimeout(() => setRecentMacroNotice(null), 3000);
     }
@@ -1403,6 +1450,10 @@ export const LiveDesktopView: React.FC = () => {
           <div className="hidden lg:flex items-center gap-2 px-2.5 py-1 rounded-lg bg-[var(--product-canvas)] border border-[var(--product-line)] text-[var(--product-text-secondary)]">
             <Activity className="w-3 h-3 text-emerald-400" />
             <span>H.264 {webrtcStats.fps} FPS</span>
+            <span className="text-[var(--product-text-dim)]">|</span>
+            <span title="Frames delivered to the video compositor">Render {webrtcStats.renderFps} FPS</span>
+            <span className="text-[var(--product-text-dim)]">|</span>
+            <span title="Estimated compositor presentation queue delay">Render delay {webrtcStats.renderDelayMs}ms</span>
             <span className="text-[var(--product-text-dim)]">|</span>
             <button
               type="button"
