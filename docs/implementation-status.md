@@ -33,8 +33,9 @@ that platform path has been exercised or production-ready.
 - OIDC, custom scheduled agents, agent run history and per-agent memory code
   exist, with configuration/provider requirements.
 - Task dependencies, redacted checkpoints, durable task events and restart
-  reconciliation are implemented. Interrupted running tasks are marked failed
-  for operator review rather than replayed. Project memory APIs record source,
+  reconciliation are implemented. Interrupted running tasks and workflows are
+  marked failed for operator review rather than replayed; trigger cooldown and
+  queued-task creation share a database transaction. Project memory APIs record source,
   optional same-tenant task evidence and expiry; custom agents with a matching
   project ID load bounded, unexpired entries into their system context.
 - Heartbeats persist a bounded device capability list and inventory object. The

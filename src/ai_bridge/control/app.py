@@ -70,7 +70,7 @@ def _claim_schedule_occurrence(conn: Any, schedule_id: str, now_ts: float, inter
 def _claim_trigger_cooldown(conn: Any, trigger_id: str, now_ts: float, cooldown_seconds: int) -> bool:
     cur = conn.execute(
         "UPDATE triggers SET last_triggered_at=? WHERE id=? "
-        "AND (last_triggered_at IS NULL OR last_triggered_at<=?)",
+        "AND enabled=1 AND (last_triggered_at IS NULL OR last_triggered_at<=?)",
         (now_ts, trigger_id, now_ts - cooldown_seconds),
     )
     claimed = cur.rowcount == 1
@@ -671,6 +671,20 @@ def create_app(*, admin_token: str | None = None, db_path: Path | None = None, d
             conn.execute(
                 "INSERT INTO task_events (task_id, tenant, event_type, actor, event_json, created_at) VALUES (?,?,?,?,?,?)",
                 (task["id"], task["tenant"], "interrupted", "system", json.dumps({"reason": "control_plane_restart"}), dbmod.now()),
+            )
+        interrupted_workflows = conn.execute(
+            "SELECT id FROM workflows WHERE status='running'"
+        ).fetchall()
+        for workflow in interrupted_workflows:
+            interrupted_at = dbmod.now()
+            conn.execute(
+                "UPDATE workflows SET status='failed', error=?, completed_at=?, updated_at=? WHERE id=? AND status='running'",
+                (
+                    "Interrupted by control-plane restart; inspect completed steps and side effects before retrying.",
+                    interrupted_at,
+                    interrupted_at,
+                    workflow["id"],
+                ),
             )
     app = FastAPI(title="AI Bridge Control Plane", version="0.3.0")
     allowed_origins = [
@@ -2603,9 +2617,6 @@ def create_app(*, admin_token: str | None = None, db_path: Path | None = None, d
                     cooldown = max(10, int(trig["cooldown_seconds"]))
                     last_trig = trig["last_triggered_at"] or 0
                     if (now_ts - last_trig) >= cooldown:
-                        if not _claim_trigger_cooldown(conn, str(trig["id"]), now_ts, cooldown):
-                            continue
-                        conn.commit()
                         act_type = trig["action_type"]
                         act_target = trig["action_target"]
                         act_args = {}
@@ -2617,14 +2628,19 @@ def create_app(*, admin_token: str | None = None, db_path: Path | None = None, d
                             task_id = uuid.uuid4().hex[:12]
                             tier = TOOL_TIERS.get(act_target)
                             t_val = tier.value if tier else 2
-                            conn.execute(
-                                "INSERT INTO tasks (id, device_id, tenant, tool, args_json, tier, status, created_at, updated_at) VALUES (?,?,?,?,?,?,'queued',?,?)",
-                                (task_id, dev_row["id"], dev_row["tenant"], act_target, json.dumps(act_args), t_val, now_ts, now_ts),
-                            )
-                            conn.commit()
+                            with conn.transaction():
+                                if not _claim_trigger_cooldown(conn, str(trig["id"]), now_ts, cooldown):
+                                    continue
+                                conn.execute(
+                                    "INSERT INTO tasks (id, device_id, tenant, tool, args_json, tier, status, created_at, updated_at) VALUES (?,?,?,?,?,?,'queued',?,?)",
+                                    (task_id, dev_row["id"], dev_row["tenant"], act_target, json.dumps(act_args), t_val, now_ts, now_ts),
+                                )
                             notify_tasks()
                             audit("trigger", dev_row["id"], f"trigger:{trig['name']}", {"metric": metric_key, "value": val, "task_id": task_id, "tool": act_target}, "executed", tenant=dev_row["tenant"])
                         elif act_type == "webhook":
+                            if not _claim_trigger_cooldown(conn, str(trig["id"]), now_ts, cooldown):
+                                continue
+                            conn.commit()
                             wh_url = act_target if act_target.startswith("http") else get_webhook_url()
                             if wh_url:
                                 evt = {
@@ -2667,7 +2683,7 @@ def create_app(*, admin_token: str | None = None, db_path: Path | None = None, d
                     try:
                         if tool_name == "__workflow__":
                             wf_steps = args.get("steps") or []
-                            if wf_steps and not getattr(app.state, "emergency_stop", False):
+                            if wf_steps and not emergency_stop_active():
                                 wf_id = uuid.uuid4().hex[:12]
                                 wf_name = str(args.get("name") or job["name"] or "Scheduled Workflow")
                                 conn.execute(
