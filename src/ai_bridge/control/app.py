@@ -48,10 +48,35 @@ from . import metrics as metricsmod
 from .csrf import generate_csrf_token, validate_csrf_token
 from .dispatch import dispatch
 from .ratelimit import make_rate_limiter, rate_limit
+from .secret_store import protect_secret, reveal_secret
 
 MAX_RESULT_CHARS = 512_000
 _DUMMY_SALT = "0" * 32
 _DUMMY_HASH = "0" * 64
+
+
+def _claim_schedule_occurrence(conn: Any, schedule_id: str, now_ts: float, interval_seconds: int) -> bool:
+    cur = conn.execute(
+        "UPDATE schedules SET last_run_at=?, next_run_at=? WHERE id=? "
+        "AND enabled=1 AND next_run_at<=?",
+        (now_ts, now_ts + interval_seconds, schedule_id, now_ts),
+    )
+    claimed = cur.rowcount == 1
+    if not claimed:
+        conn.rollback()
+    return claimed
+
+
+def _claim_trigger_cooldown(conn: Any, trigger_id: str, now_ts: float, cooldown_seconds: int) -> bool:
+    cur = conn.execute(
+        "UPDATE triggers SET last_triggered_at=? WHERE id=? "
+        "AND (last_triggered_at IS NULL OR last_triggered_at<=?)",
+        (now_ts, trigger_id, now_ts - cooldown_seconds),
+    )
+    claimed = cur.rowcount == 1
+    if not claimed:
+        conn.rollback()
+    return claimed
 
 
 def _validate_webhook_url(url: str) -> None:
@@ -656,7 +681,26 @@ def create_app(*, admin_token: str | None = None, db_path: Path | None = None, d
                        allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
     app.state.conn = conn
     app.state.admin_token = token
-    app.state.emergency_stop = False
+    stop_row = conn.execute("SELECT value FROM settings WHERE key='emergency_stop'").fetchone()
+    app.state.emergency_stop = bool(stop_row and str(stop_row["value"]).lower() == "true")
+    emergency_stop_cache = {"checked_at": time.monotonic(), "lock": threading.Lock()}
+
+    def emergency_stop_active() -> bool:
+        # Shared database state is authoritative. Refresh often enough for
+        # another worker's stop/clear action to propagate without querying DB
+        # on every scheduler or long-poll loop iteration.
+        with emergency_stop_cache["lock"]:
+            if time.monotonic() - emergency_stop_cache["checked_at"] >= 0.5:
+                row = conn.execute("SELECT value FROM settings WHERE key='emergency_stop'").fetchone()
+                app.state.emergency_stop = bool(row and str(row["value"]).lower() == "true")
+                emergency_stop_cache["checked_at"] = time.monotonic()
+            return bool(app.state.emergency_stop)
+
+    def set_emergency_stop_cache(active: bool) -> None:
+        with emergency_stop_cache["lock"]:
+            app.state.emergency_stop = active
+            emergency_stop_cache["checked_at"] = time.monotonic()
+
     task_cond = threading.Condition()
     app.state.task_cond = task_cond
 
@@ -667,7 +711,7 @@ def create_app(*, admin_token: str | None = None, db_path: Path | None = None, d
     def get_webhook_url() -> str:
         row = conn.execute("SELECT value FROM settings WHERE key='webhook_url'").fetchone()
         if row is not None and row["value"] is not None:
-            return str(row["value"]).strip()
+            return reveal_secret(row["value"]).strip()
         return os.environ.get("AI_BRIDGE_WEBHOOK_URL", "").strip()
 
     def get_public_base_url(req: Request | None = None) -> str:
@@ -902,7 +946,7 @@ def create_app(*, admin_token: str | None = None, db_path: Path | None = None, d
 
     @app.get("/health", summary="Health check", description="Returns basic health status of the control plane including version and emergency stop state.")
     def health():
-        return {"status": "ok", "version": "0.3.0", "emergency_stop": app.state.emergency_stop}
+        return {"status": "ok", "version": "0.3.0", "emergency_stop": emergency_stop_active()}
 
     @app.get("/health/live", summary="Liveness probe", description="Verifies the process is alive and responsive.")
     def health_live():
@@ -916,7 +960,7 @@ def create_app(*, admin_token: str | None = None, db_path: Path | None = None, d
             row = conn.execute("SELECT 1 AS alive").fetchone()
             if not row:
                 raise HTTPException(status_code=503, detail="Database unhealthy")
-            return {"status": "ready", "database": "connected", "emergency_stop": app.state.emergency_stop}
+            return {"status": "ready", "database": "connected", "emergency_stop": emergency_stop_active()}
         except Exception as exc:
             raise HTTPException(status_code=503, detail=f"Database probe failed: {exc}")
 
@@ -1368,7 +1412,7 @@ def create_app(*, admin_token: str | None = None, db_path: Path | None = None, d
     @app.post("/api/devices/{device_id}/refresh")
     def refresh_device_telemetry(device_id: str, body: DeviceRefreshIn | None = None, x_admin_token: str | None = Header(default=None), x_session_token: str | None = Header(default=None)):
         actor = require_role("operator", x_admin_token, x_session_token)
-        if app.state.emergency_stop:
+        if emergency_stop_active():
             raise HTTPException(status_code=403, detail="Emergency stop is active; cannot queue tasks.")
         row = conn.execute("SELECT * FROM devices WHERE id=? AND revoked=0", (device_id,)).fetchone()
         if row is None:
@@ -1409,7 +1453,7 @@ def create_app(*, admin_token: str | None = None, db_path: Path | None = None, d
         if request_key is not None and (not request_key or len(request_key) > 128 or not request_key.isascii()):
             raise HTTPException(422, "Idempotency-Key must be 1–128 ASCII characters.")
         request_hash = hashlib.sha256(json.dumps(body.model_dump(), sort_keys=True, separators=(",", ":")).encode()).hexdigest()
-        if app.state.emergency_stop:
+        if emergency_stop_active():
             raise HTTPException(status_code=403, detail="Emergency stop is active; no new tasks accepted.")
         row = conn.execute("SELECT * FROM devices WHERE id=? AND tenant=? AND revoked=0", (body.device_id, body.tenant)).fetchone()
         if row is None:
@@ -1610,7 +1654,7 @@ def create_app(*, admin_token: str | None = None, db_path: Path | None = None, d
         valid_statuses = {"queued", "running", "needs_approval", "completed", "failed", "cancelled", "timed_out"}
         if status not in valid_statuses:
             raise HTTPException(status_code=400, detail=f"Invalid status: {status}")
-        if status == "queued" and app.state.emergency_stop:
+        if status == "queued" and emergency_stop_active():
             raise HTTPException(status_code=403, detail="Emergency stop is active; cannot queue tasks.")
 
         dev_row = conn.execute("SELECT * FROM devices WHERE id=?", (row["device_id"],)).fetchone()
@@ -2078,7 +2122,12 @@ def create_app(*, admin_token: str | None = None, db_path: Path | None = None, d
     @app.post("/api/emergency-stop")
     def emergency_stop(x_admin_token: str | None = Header(default=None), x_session_token: str | None = Header(default=None)):
         actor = require_admin(x_admin_token, x_session_token)
-        app.state.emergency_stop = True
+        conn.execute(
+            "INSERT INTO settings (key, value) VALUES ('emergency_stop', 'true') "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value"
+        )
+        conn.commit()
+        set_emergency_stop_cache(True)
         notify_tasks()
         audit(actor, "", "emergency_stop", {}, "allowed")
         alertsmod.dispatch_alert("emergency_stop", "critical", "EMERGENCY STOP ACTIVATED", {"actor": actor})
@@ -2087,7 +2136,12 @@ def create_app(*, admin_token: str | None = None, db_path: Path | None = None, d
     @app.post("/api/emergency-stop/clear")
     def emergency_clear(x_admin_token: str | None = Header(default=None), x_session_token: str | None = Header(default=None)):
         require_admin(x_admin_token, x_session_token)
-        app.state.emergency_stop = False
+        conn.execute(
+            "INSERT INTO settings (key, value) VALUES ('emergency_stop', 'false') "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value"
+        )
+        conn.commit()
+        set_emergency_stop_cache(False)
         notify_tasks()
         audit("admin", "", "emergency_stop_clear", {}, "allowed")
         return {"emergency_stop": False}
@@ -2243,7 +2297,7 @@ def create_app(*, admin_token: str | None = None, db_path: Path | None = None, d
         x_session_token: str | None = Header(default=None),
     ):
         actor = require_role("operator", x_admin_token, x_session_token)
-        if app.state.emergency_stop:
+        if emergency_stop_active():
             raise HTTPException(status_code=403, detail="Emergency stop is active; workflows rejected.")
         row = conn.execute("SELECT * FROM workflows WHERE id=?", (workflow_id,)).fetchone()
         if row is None:
@@ -2451,7 +2505,7 @@ def create_app(*, admin_token: str | None = None, db_path: Path | None = None, d
         x_session_token: str | None = Header(default=None),
     ):
         actor = require_role("operator", x_admin_token, x_session_token)
-        if app.state.emergency_stop:
+        if emergency_stop_active():
             raise HTTPException(status_code=403, detail="Emergency stop is active; workflows rejected.")
         if not body.steps:
             raise HTTPException(status_code=400, detail="Workflow must contain at least one step.")
@@ -2549,7 +2603,8 @@ def create_app(*, admin_token: str | None = None, db_path: Path | None = None, d
                     cooldown = max(10, int(trig["cooldown_seconds"]))
                     last_trig = trig["last_triggered_at"] or 0
                     if (now_ts - last_trig) >= cooldown:
-                        conn.execute("UPDATE triggers SET last_triggered_at=? WHERE id=?", (now_ts, trig["id"]))
+                        if not _claim_trigger_cooldown(conn, str(trig["id"]), now_ts, cooldown):
+                            continue
                         conn.commit()
                         act_type = trig["action_type"]
                         act_target = trig["action_target"]
@@ -2600,8 +2655,8 @@ def create_app(*, admin_token: str | None = None, db_path: Path | None = None, d
                 ).fetchall()
                 for job in due_jobs:
                     interval = max(10, int(job["interval_seconds"]))
-                    next_run = now_ts + interval
-                    conn.execute("UPDATE schedules SET last_run_at=?, next_run_at=? WHERE id=?", (now_ts, next_run, job["id"]))
+                    if not _claim_schedule_occurrence(conn, str(job["id"]), now_ts, interval):
+                        continue
                     conn.commit()
                     tool_name = job["tool"]
                     try:
@@ -3642,7 +3697,7 @@ def create_app(*, admin_token: str | None = None, db_path: Path | None = None, d
         conn.execute(
             "INSERT INTO settings (key, value) VALUES ('webhook_url', ?) "
             "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
-            (url,),
+            (protect_secret(url),),
         )
         conn.commit()
         audit(actor, "", "set_webhook", {"configured": bool(url)}, "allowed")
@@ -3729,7 +3784,7 @@ def create_app(*, admin_token: str | None = None, db_path: Path | None = None, d
 
         if oidcmod.oidc_config() is None:
             raise HTTPException(status_code=400, detail="OIDC is not configured.")
-        url, _, _ = oidcmod.new_login()
+        url, _, _ = oidcmod.new_login(conn)
         return RedirectResponse(url, status_code=302)
 
     @app.get("/api/auth/oidc/callback")
@@ -3742,7 +3797,7 @@ def create_app(*, admin_token: str | None = None, db_path: Path | None = None, d
         cfg = oidcmod.oidc_config()
         if cfg is None:
             raise HTTPException(status_code=400, detail="OIDC is not configured.")
-        pending = oidcmod.pop_pending(state)
+        pending = oidcmod.pop_pending(conn, state)
         if pending is None or not code:
             raise HTTPException(status_code=400, detail="Invalid or expired login attempt.")
         try:
@@ -4147,7 +4202,7 @@ def create_app(*, admin_token: str | None = None, db_path: Path | None = None, d
 
         return {
             "device_id": row["id"],
-            "emergency_stop": app.state.emergency_stop,
+            "emergency_stop": emergency_stop_active(),
             "token_expires_at": row["token_expires_at"],
         }
 
@@ -4211,7 +4266,7 @@ def create_app(*, admin_token: str | None = None, db_path: Path | None = None, d
         deadline = time.time() + wait_sec
         task = None
         while True:
-            if app.state.emergency_stop:
+            if emergency_stop_active():
                 return {"task": None, "emergency_stop": True}
             with conn.transaction():
                 candidate = conn.execute(
@@ -4394,7 +4449,7 @@ def create_app(*, admin_token: str | None = None, db_path: Path | None = None, d
             url = ""
             row = conn.execute("SELECT value FROM settings WHERE key='webhook_url'").fetchone()
             if row is not None and row["value"]:
-                url = str(row["value"]).strip()
+                url = reveal_secret(row["value"]).strip()
             if not url:
                 url = os.environ.get("AI_BRIDGE_WEBHOOK_URL", "").strip()
             if not url:
@@ -4415,7 +4470,7 @@ def create_app(*, admin_token: str | None = None, db_path: Path | None = None, d
     agent_runner = AgentRunner(
         conn,
         _execute_workflow_step_sync,
-        is_paused=lambda: bool(getattr(app.state, "emergency_stop", False)),
+        is_paused=emergency_stop_active,
         failure_notifier=_agent_failure_notify,
     )
     install_custom_agent_routes(app, conn, require_role, audit, agent_runner)
@@ -4455,7 +4510,7 @@ def create_app(*, admin_token: str | None = None, db_path: Path | None = None, d
         stored: dict[str, str] = {}
         if row and row["value"]:
             try:
-                stored = json.loads(row["value"]) or {}
+                stored = json.loads(reveal_secret(row["value"])) or {}
             except Exception:
                 stored = {}
         env_cfg = alertsmod.get_alert_config()
@@ -4499,7 +4554,7 @@ def create_app(*, admin_token: str | None = None, db_path: Path | None = None, d
         }
         conn.execute(
             "INSERT INTO settings (key, value) VALUES ('alert_webhooks', ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-            (json.dumps(payload),),
+            (protect_secret(json.dumps(payload)),),
         )
         conn.commit()
         audit(actor, "", "update_alert_config", {"channels": [k for k, v in payload.items() if v]}, "allowed")

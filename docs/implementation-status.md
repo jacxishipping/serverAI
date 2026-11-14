@@ -19,6 +19,11 @@ that platform path has been exercised or production-ready.
 - The bounded task runner uses an allowlisted operation set, timeout/output
   bounds and a reduced environment. Optional Linux network-namespace isolation
   applies only to that runner.
+- Database-stored provider keys, webhook credentials and MCP bearer/OAuth
+  secrets/headers are Fernet-encrypted when a key is configured. The production
+  Compose profile requires the key and performs legacy-field encryption at
+  startup. An operator-run key rotation command is available; rotation and
+  encrypted backup/restore drills have not been run in this environment.
 - Linux, Windows and macOS Python agent entry points exist and use the shared
   poller. Windows also has a native C++ service/desktop implementation.
 - The dashboard has React/TypeScript source and build/test workflows.
@@ -32,9 +37,12 @@ that platform path has been exercised or production-ready.
   for operator review rather than replayed. Project memory APIs record source,
   optional same-tenant task evidence and expiry; custom agents with a matching
   project ID load bounded, unexpired entries into their system context.
-- Heartbeats can persist a bounded device capability list and inventory object;
-  the shared Python poller reports basic runtime and resource telemetry. A full
-  installed-application inventory and native-agent parity contract remain open.
+- Heartbeats persist a bounded device capability list and inventory object. The
+  shared Python poller now sends schema version 1, runtime identity, advertised
+  desktop/task/telemetry capabilities, allowlisted installed tool names, and up
+  to 100 application names discovered from standard OS locations. This is a
+  best-effort Python-agent contract; native-agent parity and host validation
+  remain open.
 
 ## Validation boundaries
 
@@ -50,9 +58,11 @@ that platform path has been exercised or production-ready.
   the PostgreSQL integration suite and connection-pool behavior are verified.
 - Reverse-proxy mTLS is optional deployment configuration. The control plane
   does not itself terminate client-certificate authentication.
-- Emergency-stop, OIDC pending state and background schedulers include
-  process-local state. Use one worker until shared durable coordination and
-  restart behavior are implemented and tested.
+- Emergency-stop state and single-use OIDC login state are persisted in the
+  database and survive process restarts. Workers refresh emergency-stop state
+  from the database at most every 500 ms. Background schedulers, rate limits and
+  other locks remain process-local, so use one worker until shared scheduler
+  ownership and the remaining multi-worker state are coordinated.
 - Browser sessions require distinct bearer tokens for distinct principals.
   Browser egress policy is defense in depth; production deployments handling
   untrusted pages should also restrict outbound network access at the host or

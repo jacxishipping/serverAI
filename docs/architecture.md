@@ -5,13 +5,16 @@
 This document includes implemented components and intended system separation.
 Today the control plane is a Python modular monolith; enrolled agents primarily
 use outbound heartbeat and HTTP long polling, while desktop media uses the
-separate WebRTC signaling and media path below. Background workflow, trigger,
-schedule, custom-agent and emergency-stop coordination still contains
-process-local state. The production container therefore runs one API worker;
-do not raise its worker count until shared scheduler ownership and durable
-emergency-stop/OIDC state are implemented. PostgreSQL is supported through the
-optional `postgres` dependency extra and pooled adapter; verify it with a live
-PostgreSQL deployment before treating it as production validated.
+separate WebRTC signaling and media path below. Background runner threads and
+several locks remain process-local; due schedule, trigger and custom-agent work
+uses atomic database claims to avoid duplicate execution across workers.
+Emergency-stop and OIDC pending state are database-backed, but emergency-stop
+changes are not propagated between live worker processes. The production
+container therefore runs one API worker; do not raise its worker count until
+shared scheduler ownership and worker-to-worker state propagation are
+implemented. PostgreSQL is supported through the optional `postgres`
+dependency extra and pooled adapter; verify it with a live PostgreSQL deployment
+before treating it as production validated.
 
 The roadmap's supervisor, planner, browser/coding role agents, durable
 cross-task checkpointing and workflow-level verification remain incremental

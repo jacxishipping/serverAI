@@ -24,6 +24,7 @@ from .mcp_oauth import (
     generate_pkce_pair,
     register_oauth_client,
 )
+from .secret_store import protect_secret, reveal_secret
 
 logger = logging.getLogger("ai_bridge.mcp_routes")
 
@@ -76,6 +77,13 @@ def _mask(val: str) -> str:
     return f"{s[:4]}...{s[-4:]}" if len(s) > 8 else "****"
 
 
+def _open_mcp_server(row: Any) -> dict[str, Any]:
+    out = dict(row)
+    for key in ("auth_token", "oauth_client_secret", "oauth_refresh_token", "headers_json"):
+        out[key] = reveal_secret(out.get(key))
+    return out
+
+
 def _serialize_mcp_server(row: dict[str, Any]) -> dict[str, Any]:
     out = dict(row)
     out["enabled"] = bool(out.get("enabled"))
@@ -86,19 +94,20 @@ def _serialize_mcp_server(row: dict[str, Any]) -> dict[str, Any]:
     out["tools"] = tools
     out["tools_count"] = len(tools)
     try:
-        headers = json.loads(out.pop("headers_json", "{}") or "{}")
+        headers = json.loads(reveal_secret(out.pop("headers_json", "{}")) or "{}")
     except Exception:
         headers = {}
-    out["headers"] = headers
+    out["headers"] = {str(key): _mask(str(value)) for key, value in headers.items()}
+    out["headers_configured"] = bool(headers)
 
-    token = str(out.pop("auth_token", None) or "").strip()
+    token = reveal_secret(out.pop("auth_token", None)).strip()
     out["token_masked"] = _mask(token)
     out["oauth_connected"] = bool(token)
 
-    secret = str(out.pop("oauth_client_secret", None) or "").strip()
+    secret = reveal_secret(out.pop("oauth_client_secret", None)).strip()
     out["oauth_secret_configured"] = bool(secret)
 
-    refresh_tok = str(out.pop("oauth_refresh_token", None) or "").strip()
+    refresh_tok = reveal_secret(out.pop("oauth_refresh_token", None)).strip()
     out["oauth_has_refresh_token"] = bool(refresh_tok)
     return out
 
@@ -310,15 +319,15 @@ def install_mcp_routes(app: Any, conn: Any, require_role: Any, audit: Any) -> No
                 body.transport,
                 auth_type,
                 auth_header,
-                auth_token,
+                protect_secret(auth_token),
                 oauth_client_id,
-                oauth_client_secret,
+                protect_secret(oauth_client_secret),
                 oauth_auth_url,
                 oauth_token_url,
                 oauth_scopes,
-                oauth_refresh_token,
+                protect_secret(oauth_refresh_token),
                 oauth_token_expires_at,
-                json.dumps(body.headers or {}),
+                protect_secret(json.dumps(body.headers or {})),
                 json.dumps(tools),
                 1 if body.enabled else 0,
                 status,
@@ -351,7 +360,7 @@ def install_mcp_routes(app: Any, conn: Any, require_role: Any, audit: Any) -> No
         row = conn.execute("SELECT * FROM mcp_servers WHERE id=?", (server_id,)).fetchone()
         if not row:
             raise HTTPException(status_code=404, detail="MCP Server not found.")
-        s = dict(row)
+        s = _open_mcp_server(row)
 
         auth_url = str(s.get("oauth_auth_url") or "").strip()
         token_url = str(s.get("oauth_token_url") or "").strip()
@@ -391,7 +400,7 @@ def install_mcp_routes(app: Any, conn: Any, require_role: Any, audit: Any) -> No
         conn.execute(
             "UPDATE mcp_servers SET auth_type='oauth2_pkce', oauth_auth_url=?, oauth_token_url=?, "
             "oauth_client_id=?, oauth_client_secret=?, updated_at=? WHERE id=?",
-            (auth_url, token_url, client_id, client_secret, now, server_id),
+            (auth_url, token_url, client_id, protect_secret(client_secret), now, server_id),
         )
 
         state = secrets.token_urlsafe(24)
@@ -460,7 +469,7 @@ def install_mcp_routes(app: Any, conn: Any, require_role: Any, audit: Any) -> No
         srv_row = conn.execute("SELECT * FROM mcp_servers WHERE id=?", (st["server_id"],)).fetchone()
         if not srv_row:
             return _html("Server Not Found", "The target MCP server no longer exists.", False)
-        s = dict(srv_row)
+        s = _open_mcp_server(srv_row)
 
         tok_res = exchange_authorization_code(
             token_url=s.get("oauth_token_url") or "",
@@ -500,8 +509,8 @@ def install_mcp_routes(app: Any, conn: Any, require_role: Any, audit: Any) -> No
             "UPDATE mcp_servers SET auth_token=?, oauth_refresh_token=?, oauth_token_expires_at=?, "
             "status=?, tools_json=?, last_checked_at=?, last_error=?, updated_at=? WHERE id=?",
             (
-                access_token,
-                refresh_token,
+                protect_secret(access_token),
+                protect_secret(refresh_token),
                 expires_at,
                 "healthy" if ok else "offline",
                 json.dumps(tools if ok else json.loads(s.get("tools_json") or "[]")),
@@ -572,7 +581,7 @@ def install_mcp_routes(app: Any, conn: Any, require_role: Any, audit: Any) -> No
         row = conn.execute("SELECT * FROM mcp_servers WHERE id=?", (server_id,)).fetchone()
         if not row:
             raise HTTPException(status_code=404, detail="MCP Server not found.")
-        current = dict(row)
+        current = _open_mcp_server(row)
 
         name = (body.name if body.name is not None else current["name"]).strip()
         url = (body.url if body.url is not None else current["url"]).strip()
@@ -594,9 +603,9 @@ def install_mcp_routes(app: Any, conn: Any, require_role: Any, audit: Any) -> No
             "oauth_client_id=?, oauth_client_secret=?, oauth_auth_url=?, oauth_token_url=?, oauth_scopes=?, "
             "headers_json=?, enabled=?, updated_at=? WHERE id=?",
             (
-                name, url, transport, auth_type, auth_header, auth_token,
-                oauth_client_id, oauth_client_secret, oauth_auth_url, oauth_token_url, oauth_scopes,
-                headers_str, enabled, now, server_id,
+                name, url, transport, auth_type, auth_header, protect_secret(auth_token),
+                oauth_client_id, protect_secret(oauth_client_secret), oauth_auth_url, oauth_token_url, oauth_scopes,
+                protect_secret(headers_str), enabled, now, server_id,
             ),
         )
         conn.commit()

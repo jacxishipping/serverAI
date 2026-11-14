@@ -49,6 +49,8 @@ CREATE TABLE IF NOT EXISTS users (
 CREATE TABLE IF NOT EXISTS sessions (
   token_hash TEXT PRIMARY KEY, username TEXT NOT NULL, role TEXT NOT NULL,
   expires_at REAL NOT NULL, created_at REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS oidc_pending (
+  state TEXT PRIMARY KEY, nonce TEXT NOT NULL, created_at REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS policies (
   id INTEGER PRIMARY KEY AUTOINCREMENT, version INTEGER NOT NULL,
   policy_json TEXT NOT NULL, created_by TEXT, created_at REAL NOT NULL, note TEXT);
@@ -428,13 +430,21 @@ class PostgresConnection:
 
 def connect(db_path: Path | None = None, database_url: str | None = None) -> LockedConnection | PostgresConnection:
     """Connect to the database, auto-detecting PostgreSQL vs SQLite, and run migrations."""
+    from .secret_store import validate_secret_store_config
+    validate_secret_store_config()
     db_url = database_url or os.environ.get("DATABASE_URL")
 
     # 1. PostgreSQL Path
     if db_url and (db_url.startswith("postgres://") or db_url.startswith("postgresql://")):
         conn = PostgresConnection(db_url)
-        from . import migrations
-        migrations.run_migrations(conn, dialect="postgres")
+        try:
+            from . import migrations
+            migrations.run_migrations(conn, dialect="postgres")
+            from .secret_store import migrate_database_secrets
+            migrate_database_secrets(conn)
+        except Exception:
+            conn.close()
+            raise
         return conn
 
     # 2. SQLite Path
@@ -453,8 +463,14 @@ def connect(db_path: Path | None = None, database_url: str | None = None) -> Loc
     raw.executescript(SCHEMA)
 
     locked_conn = LockedConnection(raw)
-    from . import migrations
-    migrations.run_migrations(locked_conn, dialect="sqlite")
+    try:
+        from . import migrations
+        migrations.run_migrations(locked_conn, dialect="sqlite")
+        from .secret_store import migrate_database_secrets
+        migrate_database_secrets(locked_conn)
+    except Exception:
+        locked_conn.close()
+        raise
     return locked_conn
 
 

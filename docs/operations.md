@@ -3,20 +3,34 @@
 - Logs: `journalctl -u ai-bridge-*`; audit via `GET /api/audit`.
 - Emergency stop: dashboard button or `POST /api/emergency-stop` (admin
   token). Clears with `POST /api/emergency-stop/clear`. While active,
-  new tasks are rejected (403) and agents report `emergency_stop: true`.
+  new tasks are rejected (403) and agents report `emergency_stop: true`. The
+  value is stored in the control database and remains active after restart.
 - Upgrades: `git fetch --tags && git checkout vX.Y.Z`, reinstall the venv,
   restart services, re-run `pytest -q`. Roll back the same way to the
   previous tag; the SQLite/Postgres schema is additive in v0.2.
 - Backups: workspace backups live in `<workspace>/.ai-bridge-backups/`
   (timestamped ZIPs). Copy them off-device; also back up `control.db`
   (or `pg_dump ai_bridge`) nightly.
+- Database secret encryption: production Compose requires
+  `AI_BRIDGE_DB_ENCRYPTION_KEY` and turns on
+  `AI_BRIDGE_REQUIRE_SECRET_ENCRYPTION`. Generate a Fernet key once with
+  `python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"`.
+  Keep it in a secret manager and back it up separately from the database.
+  On startup, an encrypted database is checked against the configured key and
+  legacy provider, webhook, and MCP secret fields are encrypted in place.
+  Restores require the same key; rotating keys requires a re-encryption process
+  before replacing the old key.
 - Rate limiting: 1200 req/min for authenticated tokens and 300 req/min for
   anonymous IPs on general API paths; authentication flows have separate limits.
   Redis can share limits between processes. Keep proxy-level limiting and
   per-tenant quotas in front of public deployments.
-- The production control API runs one worker while background schedulers and
-  emergency-stop/OIDC pending state are process-local. Do not increase the
-  worker count until those components use shared durable coordination.
+- Scheduled jobs, trigger cooldowns and custom-agent runs use atomic database
+  claims so only one worker claims a due occurrence. The runner loops and other
+  locks remain process-local; a crash after a claim can defer that occurrence
+  until its next interval. Emergency-stop and single-use OIDC state are
+  database-backed, but emergency-stop changes are not broadcast to concurrent
+  workers. Keep the one-worker deployment until these remaining boundaries
+  have shared coordination and recovery tests.
 - PostgreSQL deployments install `requirements-postgres.txt`. Tune
   `AI_BRIDGE_PG_POOL_MIN_SIZE`, `AI_BRIDGE_PG_POOL_MAX_SIZE` and
   `AI_BRIDGE_PG_POOL_WAIT_S` for the deployment; execute the PostgreSQL

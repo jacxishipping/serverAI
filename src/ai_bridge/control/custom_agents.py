@@ -34,6 +34,7 @@ from .ai_api import (
 )
 from .mcp_client import execute_mcp_tool, format_mcp_tool_for_llm
 from .mcp_oauth import enforce_mcp_tool_policy, ensure_valid_mcp_token
+from .secret_store import reveal_secret
 
 PROVIDERS = ("openai", "anthropic", "gemini", "groq", "deepseek", "ollama", "custom")
 DEFAULT_INTERVAL_S = 300
@@ -55,7 +56,19 @@ def _now() -> float:
 
 def _setting(conn: Any, key: str) -> str:
     row = conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
-    return str(row["value"]).strip() if row and row["value"] else ""
+    return reveal_secret(row["value"]).strip() if row and row["value"] else ""
+
+
+def _claim_agent_run(conn: Any, agent_id: str, now: float, interval_seconds: int) -> bool:
+    cur = conn.execute(
+        "UPDATE custom_agents SET status='running', next_run_at=?, updated_at=? "
+        "WHERE id=? AND enabled=1 AND next_run_at<=?",
+        (now + interval_seconds, now, agent_id, now),
+    )
+    claimed = cur.rowcount == 1
+    if not claimed:
+        conn.rollback()
+    return claimed
 
 
 def provider_key(conn: Any, provider: str) -> str:
@@ -754,10 +767,10 @@ class AgentRunner:
                             continue
                         self._running.add(agent["id"])
                     interval = min(MAX_INTERVAL_S, max(MIN_INTERVAL_S, int(agent.get("interval_seconds") or DEFAULT_INTERVAL_S)))
-                    self._conn.execute(
-                        "UPDATE custom_agents SET status='running', next_run_at=?, updated_at=? WHERE id=?",
-                        (now + interval, now, agent["id"]),
-                    )
+                    if not _claim_agent_run(self._conn, str(agent["id"]), now, interval):
+                        with self._lock:
+                            self._running.discard(agent["id"])
+                        continue
                     self._conn.commit()
                     threading.Thread(
                         target=self._run_one, args=(agent,), name=f"agent-run-{agent['id']}", daemon=True

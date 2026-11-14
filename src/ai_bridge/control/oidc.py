@@ -28,7 +28,6 @@ import time
 import httpx
 
 _DISCOVERY_CACHE: dict = {"at": 0.0, "doc": None}
-_PENDING: dict[str, dict] = {}
 
 
 def oidc_config() -> dict | None:
@@ -63,17 +62,20 @@ def discovery() -> dict:
     return doc
 
 
-def new_login() -> tuple[str, str, str]:
+def new_login(conn) -> tuple[str, str, str]:
     """Return (authorize_url, state, nonce) for a fresh login attempt."""
     cfg = oidc_config()
     assert cfg is not None
     doc = discovery()
     state = secrets.token_urlsafe(24)
     nonce = secrets.token_urlsafe(24)
-    _PENDING[state] = {"nonce": nonce, "at": time.time()}
-    # Prune stale attempts.
-    for key in [k for k, v in _PENDING.items() if time.time() - v["at"] > 600]:
-        _PENDING.pop(key, None)
+    now = time.time()
+    with conn.transaction():
+        conn.execute("DELETE FROM oidc_pending WHERE created_at<=?", (now - 600,))
+        conn.execute(
+            "INSERT INTO oidc_pending (state, nonce, created_at) VALUES (?,?,?)",
+            (state, nonce, now),
+        )
     params = {
         "client_id": cfg["client_id"],
         "redirect_uri": cfg["redirect_uri"],
@@ -148,8 +150,16 @@ def verify_id_token(id_token: str, expected_nonce: str) -> dict:
     return claims
 
 
-def pop_pending(state: str) -> dict | None:
-    record = _PENDING.pop(state, None)
-    if record is None or time.time() - record["at"] > 600:
+def pop_pending(conn, state: str) -> dict | None:
+    """Atomically consume a fresh login state so callbacks cannot replay it."""
+    with conn.transaction():
+        row = conn.execute(
+            "DELETE FROM oidc_pending WHERE state=? AND created_at>? RETURNING nonce, created_at",
+            (state, time.time() - 600),
+        ).fetchone()
+    if row is None:
+        # Drop expired state too; it must never become valid again.
+        conn.execute("DELETE FROM oidc_pending WHERE state=?", (state,))
+        conn.commit()
         return None
-    return record
+    return {"nonce": row["nonce"], "at": row["created_at"]}

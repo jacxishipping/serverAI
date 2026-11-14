@@ -26,6 +26,7 @@ from ..policy import TOOL_TIERS, RiskTier
 from .dispatch import dispatch
 from .mcp_client import execute_mcp_tool, format_mcp_tool_for_llm
 from .mcp_oauth import enforce_mcp_tool_policy, ensure_valid_mcp_token
+from .secret_store import protect_secret, reveal_secret
 
 # Set of tools specifically for desktop GUI automation
 DESKTOP_TOOLS = {
@@ -1394,11 +1395,11 @@ def attach_ai_routes(
         if not api_key:
             row = conn.execute("SELECT value FROM settings WHERE key=?", (f"ai_{provider}_key",)).fetchone()
             if row and row["value"]:
-                api_key = str(row["value"]).strip()
+                api_key = reveal_secret(row["value"]).strip()
         if not api_key and provider == "openai":
             row = conn.execute("SELECT value FROM settings WHERE key='ai_default_key'").fetchone()
             if row and row["value"]:
-                api_key = str(row["value"]).strip()
+                api_key = reveal_secret(row["value"]).strip()
         if not api_key:
             api_key = (
                 os.environ.get(f"AI_BRIDGE_{provider.upper()}_API_KEY")
@@ -1856,7 +1857,7 @@ def attach_ai_routes(
         masked = {}
         for p in providers:
             row = conn.execute("SELECT value FROM settings WHERE key=?", (f"ai_{p}_key",)).fetchone()
-            val = str(row["value"]).strip() if row and row["value"] else ""
+            val = reveal_secret(row["value"]).strip() if row and row["value"] else ""
             if not val:
                 val = os.environ.get(f"AI_BRIDGE_{p.upper()}_API_KEY") or os.environ.get(f"{p.upper()}_API_KEY", "")
             configured[p] = bool(val)
@@ -1911,6 +1912,8 @@ def attach_ai_routes(
         base_u = _normalize_custom_base_url(body.base_url) if p == "custom" else (body.base_url or "").strip()
 
         def _upsert_setting(k: str, v: str) -> None:
+            if (k.startswith("ai_") and k.endswith("_key")) or k == "ai_default_key":
+                v = protect_secret(v)
             conn.execute(
                 "INSERT INTO settings (key, value) VALUES (?, ?) "
                 "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
@@ -1930,7 +1933,7 @@ def attach_ai_routes(
         if not key:
             existing_key = conn.execute("SELECT value FROM settings WHERE key=?", (f"ai_{p}_key",)).fetchone()
             if existing_key and existing_key["value"]:
-                key = str(existing_key["value"]).strip()
+                key = reveal_secret(existing_key["value"]).strip()
 
         if p not in ("ollama", "custom") and not key:
             raise HTTPException(status_code=400, detail="API key is required.")
