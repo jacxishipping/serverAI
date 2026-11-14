@@ -10,11 +10,11 @@ and detailed file plan are in `engineering-audit-2026-11-14.md`.
 |---|---|---|
 | 0. Baseline and truth | Reconcile status docs, deployment profiles, runtime matrix and benchmark instrumentation | In progress |
 | 1. Ownership and safety | Isolated browser sessions, destination controls, tool permission review and native-platform validation | In progress |
-| 2. Communication and desktop reliability | Measure capture-to-render latency, reconnect, network loss, key release and multi-monitor behavior | In progress: capture/preparation metrics added; end-to-end reconnect and platform failure tests remain open |
+| 2. Communication and desktop reliability | Measure capture-to-render latency, reconnect, network loss, key release and multi-monitor behavior | In progress: capture/preparation and browser compositor metrics are instrumented; reconnect, packet-loss, key-release and multi-monitor runtime validation remain open |
 | 3. Durable task orchestration | Task state/checkpoint/event contract, restart reconciliation and single-owner/shared scheduler semantics | In progress: task recovery plus database compare-and-set claims for schedules, triggers and custom agents; crash recovery for claimed work and broader lease ownership remain open |
 | 4. Agent runtime | Bounded named responsibilities, shared context, dependencies, budgets and recovery | In progress: existing custom-agent step/tool bounds plus task dependencies; a durable supervisor and role handoff contract remain open |
 | 5. Browser and coding workflows | Isolated browser workflows and end-to-end repository change/verification lifecycle | In progress: per-principal browser contexts and destination checks; end-to-end coding lifecycle evidence remains open |
-| 6. Memory and inventory | Provenance-backed task/project memory and consistent device capabilities/inventory | In progress: project memory API and persistent heartbeat inventory; agent context retrieval and installed-app parity remain open |
+| 6. Memory and inventory | Provenance-backed task/project memory and consistent device capabilities/inventory | In progress: project memory is loaded into bounded custom-agent context; Python heartbeats send schema-v1 capabilities/tools/apps; native-agent parity and host validation remain open |
 | 7. Scale and production security | PostgreSQL pool and integration validation, shared coordination, secret/backup controls and tenant review | In progress: bounded pool, DB-backed claims, production-required credential encryption and single-worker profile; live database, backup restore, key rotation and tenant review remain open |
 | 8. Acceptance and release | Load, latency, recovery, platform and clean deployment gates | Not started |
 
