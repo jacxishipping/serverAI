@@ -430,6 +430,8 @@ class PostgresConnection:
 
 def connect(db_path: Path | None = None, database_url: str | None = None) -> LockedConnection | PostgresConnection:
     """Connect to the database, auto-detecting PostgreSQL vs SQLite, and run migrations."""
+    from .secret_store import validate_secret_store_config
+    validate_secret_store_config()
     db_url = database_url or os.environ.get("DATABASE_URL")
 
     # 1. PostgreSQL Path
@@ -437,6 +439,8 @@ def connect(db_path: Path | None = None, database_url: str | None = None) -> Loc
         conn = PostgresConnection(db_url)
         from . import migrations
         migrations.run_migrations(conn, dialect="postgres")
+        from .secret_store import migrate_database_secrets
+        migrate_database_secrets(conn)
         return conn
 
     # 2. SQLite Path
@@ -457,6 +461,8 @@ def connect(db_path: Path | None = None, database_url: str | None = None) -> Loc
     locked_conn = LockedConnection(raw)
     from . import migrations
     migrations.run_migrations(locked_conn, dialect="sqlite")
+    from .secret_store import migrate_database_secrets
+    migrate_database_secrets(locked_conn)
     return locked_conn
 
 

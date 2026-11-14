@@ -34,6 +34,7 @@ from .ai_api import (
 )
 from .mcp_client import execute_mcp_tool, format_mcp_tool_for_llm
 from .mcp_oauth import enforce_mcp_tool_policy, ensure_valid_mcp_token
+from .secret_store import reveal_secret
 
 PROVIDERS = ("openai", "anthropic", "gemini", "groq", "deepseek", "ollama", "custom")
 DEFAULT_INTERVAL_S = 300
@@ -55,7 +56,7 @@ def _now() -> float:
 
 def _setting(conn: Any, key: str) -> str:
     row = conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
-    return str(row["value"]).strip() if row and row["value"] else ""
+    return reveal_secret(row["value"]).strip() if row and row["value"] else ""
 
 
 def _claim_agent_run(conn: Any, agent_id: str, now: float, interval_seconds: int) -> bool:

@@ -48,6 +48,7 @@ from . import metrics as metricsmod
 from .csrf import generate_csrf_token, validate_csrf_token
 from .dispatch import dispatch
 from .ratelimit import make_rate_limiter, rate_limit
+from .secret_store import protect_secret, reveal_secret
 
 MAX_RESULT_CHARS = 512_000
 _DUMMY_SALT = "0" * 32
@@ -692,7 +693,7 @@ def create_app(*, admin_token: str | None = None, db_path: Path | None = None, d
     def get_webhook_url() -> str:
         row = conn.execute("SELECT value FROM settings WHERE key='webhook_url'").fetchone()
         if row is not None and row["value"] is not None:
-            return str(row["value"]).strip()
+            return reveal_secret(row["value"]).strip()
         return os.environ.get("AI_BRIDGE_WEBHOOK_URL", "").strip()
 
     def get_public_base_url(req: Request | None = None) -> str:
@@ -3678,7 +3679,7 @@ def create_app(*, admin_token: str | None = None, db_path: Path | None = None, d
         conn.execute(
             "INSERT INTO settings (key, value) VALUES ('webhook_url', ?) "
             "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
-            (url,),
+            (protect_secret(url),),
         )
         conn.commit()
         audit(actor, "", "set_webhook", {"configured": bool(url)}, "allowed")
@@ -4430,7 +4431,7 @@ def create_app(*, admin_token: str | None = None, db_path: Path | None = None, d
             url = ""
             row = conn.execute("SELECT value FROM settings WHERE key='webhook_url'").fetchone()
             if row is not None and row["value"]:
-                url = str(row["value"]).strip()
+                url = reveal_secret(row["value"]).strip()
             if not url:
                 url = os.environ.get("AI_BRIDGE_WEBHOOK_URL", "").strip()
             if not url:
@@ -4491,7 +4492,7 @@ def create_app(*, admin_token: str | None = None, db_path: Path | None = None, d
         stored: dict[str, str] = {}
         if row and row["value"]:
             try:
-                stored = json.loads(row["value"]) or {}
+                stored = json.loads(reveal_secret(row["value"])) or {}
             except Exception:
                 stored = {}
         env_cfg = alertsmod.get_alert_config()
@@ -4535,7 +4536,7 @@ def create_app(*, admin_token: str | None = None, db_path: Path | None = None, d
         }
         conn.execute(
             "INSERT INTO settings (key, value) VALUES ('alert_webhooks', ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-            (json.dumps(payload),),
+            (protect_secret(json.dumps(payload)),),
         )
         conn.commit()
         audit(actor, "", "update_alert_config", {"channels": [k for k, v in payload.items() if v]}, "allowed")

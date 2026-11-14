@@ -21,6 +21,8 @@ import urllib.request
 import uuid
 from typing import Any
 
+from .secret_store import protect_secret, reveal_secret
+
 logger = logging.getLogger("ai_bridge.mcp_oauth")
 
 
@@ -229,6 +231,9 @@ def ensure_valid_mcp_token(conn: Any, srv: dict[str, Any]) -> dict[str, Any]:
     Refreshes transparently via client_credentials or refresh_token when within 60s of expiry
     and persists the new token to the `mcp_servers` table.
     """
+    srv = dict(srv)
+    for key in ("auth_token", "oauth_client_secret", "oauth_refresh_token", "headers_json"):
+        srv[key] = reveal_secret(srv.get(key))
     auth_type = str(srv.get("auth_type") or "bearer").strip().lower()
     if auth_type not in ("oauth2_client_credentials", "oauth2_pkce"):
         return srv
@@ -275,8 +280,8 @@ def ensure_valid_mcp_token(conn: Any, srv: dict[str, Any]) -> dict[str, Any]:
             conn.execute(
                 "UPDATE mcp_servers SET auth_token=?, oauth_refresh_token=?, oauth_token_expires_at=?, updated_at=? WHERE id=?",
                 (
-                    updated["auth_token"],
-                    updated.get("oauth_refresh_token") or "",
+                    protect_secret(updated["auth_token"]),
+                    protect_secret(updated.get("oauth_refresh_token") or ""),
                     updated["oauth_token_expires_at"],
                     now,
                     srv["id"],

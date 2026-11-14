@@ -50,3 +50,16 @@ Session permissions are derived **exclusively on the backend** (`src/ai_bridge/c
 - TURN REST credentials require an administrator-supplied
   `AI_BRIDGE_TURN_SECRET`. Without it, the server returns STUN-only ICE config;
   it never generates TURN credentials from a built-in secret.
+
+## 6. Control-Database Secrets
+
+- When `AI_BRIDGE_DB_ENCRYPTION_KEY` is configured, provider keys, webhook URLs,
+  alert credentials and MCP bearer/OAuth tokens and custom headers are encrypted
+  with Fernet before they are written to SQLite or PostgreSQL. Existing plaintext
+  values are migrated in place at startup.
+- Production Compose requires the key and sets
+  `AI_BRIDGE_REQUIRE_SECRET_ENCRYPTION=1`; the control plane refuses to start
+  without a valid key. Store the key outside the database and back it up
+  separately. Database restores need the same key to recover those values.
+- Key rotation is not automatic. Re-encrypt every secret with the new key before
+  removing the old key. A wrong key is detected during startup validation.

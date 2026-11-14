@@ -11,6 +11,15 @@
 - Backups: workspace backups live in `<workspace>/.ai-bridge-backups/`
   (timestamped ZIPs). Copy them off-device; also back up `control.db`
   (or `pg_dump ai_bridge`) nightly.
+- Database secret encryption: production Compose requires
+  `AI_BRIDGE_DB_ENCRYPTION_KEY` and turns on
+  `AI_BRIDGE_REQUIRE_SECRET_ENCRYPTION`. Generate a Fernet key once with
+  `python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"`.
+  Keep it in a secret manager and back it up separately from the database.
+  On startup, an encrypted database is checked against the configured key and
+  legacy provider, webhook, and MCP secret fields are encrypted in place.
+  Restores require the same key; rotating keys requires a re-encryption process
+  before replacing the old key.
 - Rate limiting: 1200 req/min for authenticated tokens and 300 req/min for
   anonymous IPs on general API paths; authentication flows have separate limits.
   Redis can share limits between processes. Keep proxy-level limiting and

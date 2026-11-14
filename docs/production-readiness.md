@@ -42,6 +42,10 @@
   schedulers and several locks remain process-local. PostgreSQL uses a bounded
   connection pool configured with `AI_BRIDGE_PG_POOL_*`; validate it against a
   live PostgreSQL service before production rollout.
+- Production Compose requires a Fernet `AI_BRIDGE_DB_ENCRYPTION_KEY` for
+  credentials stored in settings and MCP connector records. Back it up outside
+  PostgreSQL and test encrypted backup restore with the same key; automated key
+  rotation and a restore drill remain release work.
 - Set `AI_BRIDGE_TURN_SECRET` to a high-entropy secret before using TURN REST
   credentials. Without it, ICE configuration is STUN-only.
 - Core navigation/sign-in translations ship as a 20-locale preview with RTL

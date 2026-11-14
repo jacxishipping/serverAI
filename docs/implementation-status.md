@@ -19,6 +19,10 @@ that platform path has been exercised or production-ready.
 - The bounded task runner uses an allowlisted operation set, timeout/output
   bounds and a reduced environment. Optional Linux network-namespace isolation
   applies only to that runner.
+- Database-stored provider keys, webhook credentials and MCP bearer/OAuth
+  secrets/headers are Fernet-encrypted when a key is configured. The production
+  Compose profile requires the key and performs legacy-field encryption at
+  startup; key rotation and encrypted backup/restore drills remain unverified.
 - Linux, Windows and macOS Python agent entry points exist and use the shared
   poller. Windows also has a native C++ service/desktop implementation.
 - The dashboard has React/TypeScript source and build/test workflows.
