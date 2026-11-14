@@ -1,0 +1,28 @@
+.venv/
+__pycache__/
+.pytest_cache/
+*.py[cod]
+.env
+.DS_Store
+.ai-bridge/
+*.db
+apps/dashboard/node_modules/
+apps/dashboard/dist/
+apps/dashboard/test-results/
+apps/dashboard/playwright-report/
+ai-bridge-workspace/
+.vscode/
+.vscode/
+
+
+.agents/teamwork/
+windows-agent/build/
+
+# PyInstaller output for the Windows installer (deployment/windows/build_exe.py)
+/build/
+/dist/
+*.pem
+*.key
+
+# local run artifacts (control-plane data, workspace, logs, captures)
+.run/

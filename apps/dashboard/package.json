@@ -1,0 +1,33 @@
+{
+  "name": "ai-bridge-dashboard",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -b && vite build",
+    "preview": "vite preview",
+    "test": "tsx src/tests/run-all-tests.ts && npm run test:i18n",
+    "test:i18n": "tsx --test src/tests/catalogs.test.ts",
+    "test:browser": "playwright test"
+  },
+  "dependencies": {
+    "@jacxishippingorg/jx-ui-react": "^3.0.0",
+    "lucide-react": "^0.469.0",
+    "motion": "^14.9.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@axe-core/playwright": "^4.14.0",
+    "@playwright/test": "^1.64.1",
+    "@tailwindcss/vite": "^4.3.3",
+    "@types/react": "^18.3.3",
+    "@types/react-dom": "^18.3.0",
+    "@vitejs/plugin-react": "^4.3.1",
+    "tailwindcss": "^4.3.3",
+    "tsx": "^4.23.15",
+    "typescript": "^5.5.0",
+    "vite": "^5.4.0"
+  }
+}

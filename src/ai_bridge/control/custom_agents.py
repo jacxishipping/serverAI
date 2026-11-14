@@ -1,0 +1,1257 @@
+"""Persistent custom AI agents with a 24/7 runner.
+
+Each agent binds a natural-language objective to an already-configured AI
+provider (or a custom OpenAI-compatible endpoint) and a set of enrolled
+devices. The runner executes every enabled agent on its own interval for as
+long as the control-plane process is alive, recording each run and its
+tool actions in the main audit log alongside the per-agent run history.
+"""
+from __future__ import annotations
+
+import json
+import os
+import threading
+import time
+import urllib.error
+import urllib.request
+import uuid
+from typing import Any, Callable
+
+from fastapi import Header, HTTPException
+from pydantic import BaseModel, Field
+
+from .ai_api import (
+    ANTHROPIC_VERSION,
+    _drop_images,
+    _extract_image,
+    _has_image_parts,
+    _image_user_message,
+    _normalize_custom_base_url,
+    _post_anthropic,
+    _strip_image_fields,
+    build_tool_specs,
+)
+from .mcp_client import execute_mcp_tool, format_mcp_tool_for_llm
+from .mcp_oauth import enforce_mcp_tool_policy, ensure_valid_mcp_token
+from . import alerts as alertsmod
+
+PROVIDERS = ("openai", "anthropic", "gemini", "groq", "deepseek", "ollama", "custom")
+DEFAULT_INTERVAL_S = 300
+MIN_INTERVAL_S = 30
+MAX_INTERVAL_S = 86400
+RUNNER_TICK_S = 5.0
+MAX_CONCURRENT_RUNS = 2
+MAX_STEPS = 8
+MAX_CONSECUTIVE_FAILURES = 5
+RETRY_DELAY_S = 2.0
+DEVICE_ONLINE_WINDOW_S = 120.0
+
+ToolExecutor = Callable[[str, dict[str, Any], str | None, str, str], dict[str, Any]]
+
+
+def _now() -> float:
+    return time.time()
+
+
+def _setting(conn: Any, key: str) -> str:
+    row = conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+    return str(row["value"]).strip() if row and row["value"] else ""
+
+
+def provider_key(conn: Any, provider: str) -> str:
+    """API key already connected for a provider (settings, then environment)."""
+    prefix = provider.upper()
+    return (
+        _setting(conn, f"ai_{provider}_key")
+        or os.environ.get(f"AI_BRIDGE_{prefix}_API_KEY", "")
+        or os.environ.get(f"{prefix}_API_KEY", "")
+    )
+
+
+def resolve_llm(conn: Any, provider: str, model: str | None, base_url: str | None) -> tuple[str, str, str, str]:
+    """Return (provider, base_url, api_key, model) for an agent run."""
+    p = (provider or "openai").lower().strip()
+    if p not in PROVIDERS:
+        raise RuntimeError(f"Unsupported AI provider: {provider}")
+    if p == "custom":
+        url = _normalize_custom_base_url(
+            base_url
+            or _setting(conn, "ai_custom_base_url")
+            or os.environ.get("AI_BRIDGE_CUSTOM_BASE_URL", "")
+        )
+        if not url:
+            raise RuntimeError("Custom AI provider needs a base URL.")
+        resolved_model = (model or _setting(conn, "ai_custom_model") or "default").strip()
+        return p, url, provider_key(conn, "custom"), resolved_model
+
+    defaults = {
+        "anthropic": ("https://api.anthropic.com/v1", "claude-3-5-sonnet-20241022"),
+        "groq": ("https://api.groq.com/openai/v1", "llama-3.1-70b-versatile"),
+        "deepseek": ("https://api.deepseek.com/v1", "deepseek-chat"),
+        "gemini": ("https://generativelanguage.googleapis.com/v1beta/openai", "gemini-1.5-pro"),
+        "ollama": ("http://localhost:11434/v1", "llama3.1:8b"),
+    }
+    default_url, default_model = defaults.get(p, ("https://api.openai.com/v1", "gpt-4o"))
+    return p, default_url, provider_key(conn, p), (model or default_model).strip()
+
+
+def _bound_devices(conn: Any, agent: dict[str, Any]) -> list[dict[str, Any]]:
+    try:
+        device_ids = json.loads(agent.get("device_ids_json") or "[]")
+    except Exception:
+        device_ids = []
+    devices: list[dict[str, Any]] = []
+    for device_id in device_ids:
+        row = conn.execute(
+            "SELECT id, name, hostname, os, status, last_seen FROM devices WHERE id=? AND revoked=0",
+            (device_id,),
+        ).fetchone()
+        if row:
+            devices.append(dict(row))
+    return devices
+
+
+def _online_bound_devices(devices: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    now = _now()
+    out: list[dict[str, Any]] = []
+    for d in devices:
+        status = str(d.get("status") or "").lower()
+        last_seen = d.get("last_seen")
+        if status == "online":
+            out.append(d)
+            continue
+        try:
+            if last_seen is not None and (now - float(last_seen)) <= DEVICE_ONLINE_WINDOW_S:
+                out.append(d)
+        except (TypeError, ValueError):
+            pass
+    return out
+
+
+def _resolve_device(devices: list[dict[str, Any]], requested: Any) -> str | None:
+    """Map a model-supplied device name/id onto the agent's bound devices."""
+    if not devices:
+        return None
+    if requested:
+        wanted = str(requested).strip().lower()
+        for device in devices:
+            names = {
+                str(device.get("id") or "").lower(),
+                str(device.get("name") or "").lower(),
+                str(device.get("hostname") or "").lower(),
+            }
+            if wanted in names:
+                return str(device["id"])
+    return str(devices[0]["id"])
+
+
+def _resolve_agent_mcp_servers(conn: Any, agent: dict[str, Any]) -> list[dict[str, Any]]:
+    try:
+        raw_ids = json.loads(agent.get("mcp_server_ids_json") or "[]")
+    except Exception:
+        raw_ids = []
+
+    if raw_ids:
+        placeholders = ",".join("?" for _ in raw_ids)
+        rows = conn.execute(
+            f"SELECT * FROM mcp_servers WHERE id IN ({placeholders}) AND enabled=1",
+            tuple(raw_ids),
+        ).fetchall()
+        return [dict(r) for r in rows]
+    return []
+
+
+def _fleet_context_block(conn: Any, devices: list[dict[str, Any]]) -> str:
+    try:
+        pending_appr = conn.execute("SELECT COUNT(*) AS c FROM approvals WHERE status='pending'").fetchone()["c"]
+        dev_ids = [d["id"] for d in devices if d.get("id")]
+        failed_tasks = 0
+        if dev_ids:
+            placeholders = ",".join("?" for _ in dev_ids)
+            failed_tasks = conn.execute(
+                f"SELECT COUNT(*) AS c FROM tasks WHERE status='failed' AND device_id IN ({placeholders})",
+                tuple(dev_ids),
+            ).fetchone()["c"]
+        return f"\nLive Fleet Context: {pending_appr} pending human approval(s), {failed_tasks} failed task(s) on bound devices.\n"
+    except Exception:
+        return ""
+
+
+_AGENT_NATIVE_TOOLS: list[dict[str, Any]] = [
+    {
+        "type": "function",
+        "function": {
+            "name": "agent_remember",
+            "description": "Persist an important fact, observation, or learned rule into long-term agent memory so it survives future cycles.",
+            "parameters": {
+                "type": "object",
+                "properties": {"fact": {"type": "string", "description": "Concise fact to remember."}},
+                "required": ["fact"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "agent_notify",
+            "description": "Send an alert notification to configured operator channels (Slack, Discord, Telegram, Webhook).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string"},
+                    "message": {"type": "string"},
+                    "severity": {"type": "string", "enum": ["info", "warning", "critical"]},
+                },
+                "required": ["title", "message"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "agent_request_approval",
+            "description": "Queue a sensitive task for human operator approval in the Approvals queue instead of running it unattended.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "device": {"type": "string", "description": "Target device id."},
+                    "tool": {"type": "string", "description": "Tool name to request approval for."},
+                    "args": {"type": "object", "description": "Tool arguments."},
+                    "reason": {"type": "string", "description": "Why this action is needed."},
+                },
+                "required": ["device", "tool", "reason"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "agent_delegate",
+            "description": "Delegate a subtask to another specialized custom agent (by id or name) and receive its response.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "target_agent": {"type": "string", "description": "Target agent id or exact name."},
+                    "prompt": {"type": "string", "description": "Task or question for the target agent."},
+                },
+                "required": ["target_agent", "prompt"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "agent_run_workflow",
+            "description": "Create and execute a deterministic multi-step workflow and record it in Workflows.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Workflow name."},
+                    "device": {"type": "string", "description": "Target device id (optional)."},
+                    "stop_on_failure": {"type": "boolean"},
+                    "steps": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "name": {"type": "string"},
+                                "action": {"type": "string"},
+                                "args": {"type": "object"},
+                            },
+                            "required": ["action"],
+                        },
+                    },
+                },
+                "required": ["name", "steps"],
+            },
+        },
+    },
+]
+
+
+def _peer_agents_block(conn: Any, agent: dict[str, Any]) -> str:
+    try:
+        rows = conn.execute(
+            "SELECT id, name, instruction FROM custom_agents WHERE id!=? AND enabled=1 ORDER BY name LIMIT 12",
+            (agent.get("id") or "",),
+        ).fetchall()
+        if not rows:
+            return ""
+        lines = [f"- {r['name']} (id {r['id']}): {str(r['instruction'] or '')[:100]}" for r in rows]
+        return "\nPeer Agents available via agent_delegate:\n" + "\n".join(lines) + "\n"
+    except Exception:
+        return ""
+
+
+def _system_prompt(agent: dict[str, Any], devices: list[dict[str, Any]], mcp_servers: list[dict[str, Any]] | None = None, fleet_context: str = "", peer_agents: str = "") -> str:
+    listing = "\n".join(
+        f"- {d.get('name')} (id {d['id']}, {d.get('os') or 'unknown OS'}, {d.get('status') or 'unknown'})"
+        for d in devices
+    ) or "- local (the control-plane host)"
+    memory = str(agent.get("memory") or "").strip()
+    memory_block = f"\nMemory from previous cycles (most recent last):\n{memory}\n" if memory else ""
+
+    mcp_block = ""
+    if mcp_servers:
+        srv_lines = []
+        for s in mcp_servers:
+            try:
+                tools_list = json.loads(s.get("tools_json") or "[]")
+                names = [t.get("name") for t in tools_list if isinstance(t, dict) and t.get("name")]
+                t_summary = f"({len(names)} tool{'s' if len(names) != 1 else ''}: {', '.join(names[:6])}{'...' if len(names) > 6 else ''})"
+            except Exception:
+                t_summary = ""
+            srv_lines.append(f"- {s.get('name')} {t_summary}")
+        mcp_block = f"\nConnected MCP Services (use their mcp__* tools when relevant):\n" + "\n".join(srv_lines) + "\n"
+
+    return (
+        f"You are '{agent.get('name')}', an autonomous operator agent managed by AI Bridge.\n"
+        f"Objective:\n{agent.get('instruction')}\n\n"
+        f"Bound devices (pass one of these ids in the `device` argument):\n{listing}\n\n"
+        f"{mcp_block}"
+        f"{peer_agents}"
+        f"{fleet_context}"
+        f"{memory_block}"
+        "Rules:\n"
+        "1. Move the objective forward every cycle; do not repeat work already completed.\n"
+        "2. Prefer read-only inspection before changes, and verify what you changed.\n"
+        "3. For GUI work, call take_screenshot first and act on the returned image; "
+        "screenshot coordinates are native screen pixels.\n"
+        "4. Stay inside the objective's scope and use only the bound devices and connected MCP tools.\n"
+        "5. When the objective is satisfied, or it needs a human, reply in plain text "
+        "starting with DONE and explain why."
+    )
+
+
+def _is_transient_http_error(exc: Exception) -> bool:
+    code = getattr(exc, "code", None)
+    if code is None and isinstance(exc, urllib.error.HTTPError):
+        code = exc.code
+    if code is not None:
+        try:
+            c = int(code)
+            return c == 429 or 500 <= c < 600
+        except (TypeError, ValueError):
+            pass
+    # Transport-level failures are also worth one retry.
+    return isinstance(exc, (urllib.error.URLError, TimeoutError, ConnectionError))
+
+
+def execute_agent(
+    conn: Any,
+    agent: dict[str, Any],
+    tool_executor: ToolExecutor,
+    *,
+    max_steps: int = MAX_STEPS,
+    user_prompt: str | None = None,
+    _depth: int = 0,
+) -> dict[str, Any]:
+    """Run one reasoning cycle for an agent. Raises on provider/transport errors."""
+    provider, base_url, api_key, model = resolve_llm(
+        conn, agent.get("provider") or "openai", agent.get("model"), agent.get("base_url")
+    )
+    devices = _bound_devices(conn, agent)
+    if not devices:
+        raise RuntimeError("The agent has no bound devices. Assign at least one device.")
+
+    mcp_servers = _resolve_agent_mcp_servers(conn, agent)
+
+    # 1. Device tools (with optional allowed_tools filter)
+    try:
+        allowed_tools = json.loads(agent.get("allowed_tools_json") or "[]")
+    except Exception:
+        allowed_tools = []
+
+    tools_spec = build_tool_specs(tool_format="openai")
+    if allowed_tools and isinstance(allowed_tools, list) and len(allowed_tools) > 0:
+        tools_spec = [t for t in tools_spec if t.get("function", {}).get("name") in allowed_tools]
+    tools_spec.extend(_AGENT_NATIVE_TOOLS)
+
+    # 2. External MCP tools
+    mcp_dispatch_map: dict[str, tuple[dict[str, Any], str]] = {}
+    for srv in mcp_servers:
+        try:
+            srv_tools = json.loads(srv.get("tools_json") or "[]")
+        except Exception:
+            srv_tools = []
+        for t in srv_tools:
+            if not isinstance(t, dict):
+                continue
+            formatted = format_mcp_tool_for_llm(t, srv["id"], srv["name"], tool_format="openai")
+            q_name = formatted["function"]["name"]
+            tools_spec.append(formatted)
+            mcp_dispatch_map[q_name] = (srv, t.get("name") or "tool")
+
+    fleet_ctx = _fleet_context_block(conn, devices)
+    peer_ctx = _peer_agents_block(conn, agent) if _depth < 2 else ""
+    default_prompt = (
+        "Run one work cycle now "
+        f"({time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime())} UTC). "
+        "Act on the objective, then summarise what you did."
+    )
+    messages: list[dict[str, Any]] = [
+        {"role": "system", "content": _system_prompt(agent, devices, mcp_servers, fleet_ctx, peer_ctx)},
+        {"role": "user", "content": (user_prompt or "").strip() or default_prompt},
+    ]
+    steps: list[dict[str, Any]] = []
+    tenant = str(agent.get("tenant") or "default")
+    actor = f"agent:{agent.get('name') or agent.get('id')}"
+    vision_enabled = True
+    is_anthropic = provider == "anthropic"
+
+    for _ in range(max(1, min(int(max_steps), 20))):
+        headers = {"Content-Type": "application/json", "User-Agent": "AI-Bridge/0.3"}
+        if is_anthropic:
+            headers["x-api-key"] = api_key
+            headers["anthropic-version"] = ANTHROPIC_VERSION
+        elif api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+        elif provider == "ollama":
+            headers["Authorization"] = "Bearer ollama"
+
+        message = None
+        last_exc: Exception | None = None
+        for attempt in range(2):  # initial + one retry (transient error or image fallback)
+            payload_messages = messages if vision_enabled else _drop_images(messages)
+            try:
+                if is_anthropic:
+                    message = _post_anthropic(base_url, api_key, model, payload_messages, tools_spec, 0.2, timeout=90)
+                else:
+                    request = urllib.request.Request(
+                        f"{base_url}/chat/completions",
+                        data=json.dumps({
+                            "model": model,
+                            "messages": payload_messages,
+                            "tools": tools_spec,
+                            "tool_choice": "auto",
+                            "temperature": 0.2,
+                        }).encode("utf-8"),
+                        headers=headers,
+                        method="POST",
+                    )
+                    with urllib.request.urlopen(request, timeout=90) as response:
+                        body = json.loads(response.read().decode("utf-8"))
+                    message = (body.get("choices") or [{}])[0].get("message") or {}
+                last_exc = None
+                break
+            except urllib.error.HTTPError as exc:
+                detail = exc.read().decode("utf-8") if exc.fp else str(exc)
+                last_exc = RuntimeError(f"LLM provider returned HTTP {exc.code}: {detail[:300]}")
+                if attempt == 0 and vision_enabled and _has_image_parts(messages):
+                    # Text-only model: retry without image parts.
+                    vision_enabled = False
+                    continue
+                if attempt == 0 and _is_transient_http_error(exc):
+                    time.sleep(RETRY_DELAY_S)
+                    continue
+                raise last_exc from exc
+            except Exception as exc:  # noqa: BLE001 - surface transport failures to the run log
+                last_exc = RuntimeError(f"Could not reach LLM provider at {base_url}: {exc}")
+                if attempt == 0 and _is_transient_http_error(exc):
+                    time.sleep(RETRY_DELAY_S)
+                    continue
+                raise last_exc from exc
+        if message is None:
+            if last_exc is not None:
+                raise last_exc
+            raise RuntimeError("Empty LLM response.")
+
+        tool_calls = message.get("tool_calls") or []
+        if not tool_calls:
+            return {
+                "provider": provider,
+                "model": model,
+                "response": message.get("content") or "",
+                "steps": steps,
+                "devices": [d["id"] for d in devices],
+                "actor": actor,
+            }
+
+        messages.append(message)
+        images: list[tuple[str, str, int | None, int | None, str]] = []
+        for call in tool_calls:
+            function = call.get("function") or {}
+            tool_name = function.get("name") or ""
+            try:
+                tool_args = json.loads(function.get("arguments") or "{}")
+            except Exception:
+                tool_args = {}
+
+            if tool_name in {"agent_remember", "agent_notify", "agent_request_approval", "agent_delegate", "agent_run_workflow"}:
+                try:
+                    if tool_name == "agent_remember":
+                        fact = str(tool_args.get("fact") or "").strip()
+                        if not fact:
+                            result = {"ok": False, "error": "fact is required."}
+                        else:
+                            cur_mem = str(agent.get("memory") or "").strip()
+                            pinned = f"[PINNED {time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime())}] {fact}"
+                            updated_mem = (cur_mem + "\n" + pinned).strip() if cur_mem else pinned
+                            if len(updated_mem) > 8000:
+                                updated_mem = updated_mem[-8000:]
+                            agent["memory"] = updated_mem
+                            conn.execute("UPDATE custom_agents SET memory=?, updated_at=? WHERE id=?", (updated_mem, _now(), agent["id"]))
+                            conn.commit()
+                            result = {"ok": True, "remembered": fact}
+                    elif tool_name == "agent_notify":
+                        title = str(tool_args.get("title") or f"Agent {agent.get('name')}").strip()
+                        msg = str(tool_args.get("message") or "").strip()
+                        sev = str(tool_args.get("severity") or "info").lower()
+                        if sev not in {"info", "warning", "critical"}:
+                            sev = "info"
+                        res = alertsmod.dispatch_alert("agent_alert", sev, title, {"agent": agent.get("name"), "message": msg}, async_dispatch=False)
+                        result = {"ok": True, "dispatched": res}
+                    elif tool_name == "agent_delegate":
+                        if _depth >= 2:
+                            result = {"ok": False, "error": "Maximum agent delegation depth (2) reached."}
+                        else:
+                            target_key = str(tool_args.get("target_agent") or "").strip()
+                            sub_prompt = str(tool_args.get("prompt") or "").strip()
+                            t_row = conn.execute(
+                                "SELECT * FROM custom_agents WHERE id=? OR LOWER(name)=LOWER(?) LIMIT 1",
+                                (target_key, target_key),
+                            ).fetchone()
+                            if t_row is None:
+                                result = {"ok": False, "error": f"Target agent '{target_key}' not found."}
+                            elif t_row["id"] == agent.get("id"):
+                                result = {"ok": False, "error": "Cannot delegate to self."}
+                            else:
+                                sub_res = execute_agent(conn, dict(t_row), tool_executor, user_prompt=sub_prompt, _depth=_depth + 1)
+                                result = {
+                                    "ok": True,
+                                    "agent_id": t_row["id"],
+                                    "agent_name": t_row["name"],
+                                    "response": sub_res.get("response"),
+                                    "steps_count": len(sub_res.get("steps") or []),
+                                }
+                    elif tool_name == "agent_run_workflow":
+                        wf_name = str(tool_args.get("name") or f"Agent Workflow ({agent.get('name')})").strip()
+                        wf_steps = tool_args.get("steps") if isinstance(tool_args.get("steps"), list) else []
+                        wf_dev = _resolve_device(devices, tool_args.get("device")) or (devices[0]["id"] if devices else "local")
+                        stop_on_fail = bool(tool_args.get("stop_on_failure", True))
+                        if not wf_steps:
+                            result = {"ok": False, "error": "Workflow steps list is required."}
+                        else:
+                            wf_id = uuid.uuid4().hex[:12]
+                            now_ts = _now()
+                            conn.execute(
+                                "INSERT INTO workflows (id, name, tenant, device_id, steps_json, status, current_step, total_steps, results_json, created_at, updated_at) VALUES (?,?,?,?,?,'running',0,?,'[]',?,?)",
+                                (wf_id, wf_name, tenant, wf_dev, json.dumps(wf_steps), len(wf_steps), now_ts, now_ts),
+                            )
+                            conn.commit()
+                            wf_results = []
+                            wf_ok = True
+                            wf_err = ""
+                            for s_idx, st in enumerate(wf_steps):
+                                st_action = str(st.get("action") or "").strip()
+                                st_args = st.get("args") if isinstance(st.get("args"), dict) else {}
+                                st_name = str(st.get("name") or f"Step {s_idx + 1}")
+                                conn.execute("UPDATE workflows SET current_step=?, updated_at=? WHERE id=?", (s_idx + 1, _now(), wf_id))
+                                conn.commit()
+                                t0 = _now()
+                                try:
+                                    st_res = tool_executor(st_action, st_args, wf_dev, tenant, actor)
+                                    wf_results.append({"index": s_idx + 1, "name": st_name, "action": st_action, "args": st_args, "status": "completed", "duration_seconds": round(_now() - t0, 2), "result": st_res, "error": None})
+                                except Exception as st_exc:
+                                    wf_ok = False
+                                    wf_err = str(st_exc)
+                                    wf_results.append({"index": s_idx + 1, "name": st_name, "action": st_action, "args": st_args, "status": "failed", "duration_seconds": round(_now() - t0, 2), "result": None, "error": wf_err})
+                                    if stop_on_fail:
+                                        break
+                            fin_status = "completed" if wf_ok else "failed"
+                            conn.execute(
+                                "UPDATE workflows SET status=?, error=?, results_json=?, completed_at=?, updated_at=? WHERE id=?",
+                                (fin_status, wf_err, json.dumps(wf_results, default=str), _now(), _now(), wf_id),
+                            )
+                            conn.commit()
+                            result = {"ok": wf_ok, "workflow_id": wf_id, "status": fin_status, "steps_executed": len(wf_results), "error": wf_err or None}
+                    else:
+                        req_dev = _resolve_device(devices, tool_args.get("device")) or (devices[0]["id"] if devices else "local")
+                        req_tool = str(tool_args.get("tool") or "").strip()
+                        req_args = tool_args.get("args") if isinstance(tool_args.get("args"), dict) else {}
+                        req_reason = str(tool_args.get("reason") or "Agent requested human approval.").strip()
+                        task_id = uuid.uuid4().hex[:12]
+                        app_id = uuid.uuid4().hex[:12]
+                        now_ts = _now()
+                        conn.execute(
+                            "INSERT INTO tasks (id, device_id, tenant, tool, args_json, tier, status, approval_id, created_at, updated_at) VALUES (?,?,?,?,?,3,'needs_approval',?,?,?)",
+                            (task_id, req_dev, tenant, req_tool, json.dumps(req_args), app_id, now_ts, now_ts),
+                        )
+                        conn.execute(
+                            "INSERT INTO approvals (id, task_id, tool, reason, status, created_at, expires_at, policy_version) VALUES (?,?,?,?,'pending',?,?,0)",
+                            (app_id, task_id, req_tool, f"[{actor}] {req_reason}", now_ts, now_ts + 900),
+                        )
+                        conn.commit()
+                        result = {"ok": True, "task_id": task_id, "approval_id": app_id, "status": "needs_approval"}
+                except Exception as exc:
+                    result = {"ok": False, "error": str(exc)}
+                steps.append({"tool": tool_name, "device": "control-plane", "args": tool_args, "result": result})
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": call.get("id"),
+                    "name": tool_name,
+                    "content": json.dumps(result, default=str)[:20000],
+                })
+            elif tool_name in mcp_dispatch_map:
+                srv, orig_tool = mcp_dispatch_map[tool_name]
+                policy_check = enforce_mcp_tool_policy(
+                    conn, srv, orig_tool, tool_args, actor=f"agent:{agent.get('name') or agent.get('id')}"
+                )
+                if not policy_check.get("allowed", True):
+                    result = {
+                        "ok": False,
+                        "status": policy_check.get("status", "denied"),
+                        "approval_id": policy_check.get("approval_id"),
+                        "error": policy_check.get("error"),
+                    }
+                else:
+                    try:
+                        extra_h = json.loads(srv.get("headers_json") or "{}")
+                    except Exception:
+                        extra_h = {}
+                    try:
+                        srv = ensure_valid_mcp_token(conn, srv)
+                        mcp_res = execute_mcp_tool(
+                            url=srv["url"],
+                            tool_name=orig_tool,
+                            arguments=tool_args,
+                            auth_header=srv.get("auth_header") or "",
+                            auth_token=srv.get("auth_token") or "",
+                            extra_headers=extra_h,
+                        )
+                        result = mcp_res.get("result", mcp_res)
+                    except Exception as exc:
+                        result = {"ok": False, "error": f"MCP execution error: {exc}"}
+
+                steps.append(
+                    {
+                        "tool": tool_name,
+                        "device": f"mcp:{srv['name']}",
+                        "args": tool_args,
+                        "result": result,
+                    }
+                )
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": call.get("id"),
+                        "name": tool_name,
+                        "content": json.dumps(_strip_image_fields(result), default=str)[:20000],
+                    }
+                )
+            else:
+                requested_device = tool_args.pop("device", None)
+                device_id = _resolve_device(devices, requested_device)
+                try:
+                    result = tool_executor(tool_name, tool_args, device_id, tenant, actor)
+                except Exception as exc:  # noqa: BLE001 - tool errors feed back to the model
+                    result = {"ok": False, "error": str(exc)}
+                steps.append(
+                    {
+                        "tool": tool_name,
+                        "device": device_id or "local",
+                        "args": tool_args,
+                        "result": result,
+                    }
+                )
+                image = _extract_image(result) if isinstance(result, dict) else None
+                if image:
+                    images.append((image[0], image[1], image[2], image[3], tool_name))
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": call.get("id"),
+                        "name": tool_name,
+                        "content": json.dumps(_strip_image_fields(result), default=str)[:20000],
+                    }
+                )
+        if images and vision_enabled:
+            messages.append(_image_user_message(images))
+
+    return {
+        "provider": provider,
+        "model": model,
+        "response": "Step limit reached before the objective completed.",
+        "steps": steps,
+        "devices": [d["id"] for d in devices],
+        "actor": actor,
+    }
+
+
+class AgentRunner:
+    """Background scheduler that keeps enabled agents running 24/7."""
+
+    def __init__(
+        self,
+        conn: Any,
+        tool_executor: ToolExecutor,
+        is_paused: Callable[[], bool] | None = None,
+        get_webhook_url: Callable[[], str] | None = None,
+        failure_notifier: Callable[[dict[str, Any]], None] | None = None,
+    ) -> None:
+        self._conn = conn
+        self._tool_executor = tool_executor
+        self._is_paused = is_paused
+        self._get_webhook_url = get_webhook_url
+        self._failure_notifier = failure_notifier
+        self._running: set[str] = set()
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> "AgentRunner":
+        if self._thread is None:
+            self._thread = threading.Thread(target=self._loop, name="custom-agent-runner", daemon=True)
+            self._thread.start()
+        return self
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    def _loop(self) -> None:
+        while not self._stop.wait(RUNNER_TICK_S):
+            try:
+                if self._is_paused and self._is_paused():
+                    continue
+                now = _now()
+                due = self._conn.execute(
+                    "SELECT * FROM custom_agents WHERE enabled=1 AND next_run_at<=? "
+                    "ORDER BY next_run_at ASC LIMIT 10",
+                    (now,),
+                ).fetchall()
+                for row in due:
+                    agent = dict(row)
+                    with self._lock:
+                        if agent["id"] in self._running or len(self._running) >= MAX_CONCURRENT_RUNS:
+                            continue
+                        self._running.add(agent["id"])
+                    interval = min(MAX_INTERVAL_S, max(MIN_INTERVAL_S, int(agent.get("interval_seconds") or DEFAULT_INTERVAL_S)))
+                    self._conn.execute(
+                        "UPDATE custom_agents SET status='running', next_run_at=?, updated_at=? WHERE id=?",
+                        (now + interval, now, agent["id"]),
+                    )
+                    self._conn.commit()
+                    threading.Thread(
+                        target=self._run_one, args=(agent,), name=f"agent-run-{agent['id']}", daemon=True
+                    ).start()
+            except Exception:  # noqa: BLE001 - the runner must survive transient DB errors
+                time.sleep(1)
+
+    def _run_one(self, agent: dict[str, Any]) -> None:
+        agent_id = str(agent["id"])
+        run_id = uuid.uuid4().hex[:16]
+        started = _now()
+        tenant = str(agent.get("tenant") or "default")
+        self._conn.execute(
+            "INSERT INTO agent_runs (id, agent_id, tenant, status, started_at) VALUES (?,?,?,'running',?)",
+            (run_id, agent_id, tenant, started),
+        )
+        self._conn.commit()
+        try:
+            fresh = self._conn.execute("SELECT * FROM custom_agents WHERE id=?", (agent_id,)).fetchone()
+            if not fresh:
+                self._conn.execute("UPDATE agent_runs SET status='skipped', finished_at=? WHERE id=?", (_now(), run_id))
+                self._conn.commit()
+                return
+            fresh = dict(fresh)
+            if not fresh.get("enabled"):
+                self._conn.execute("UPDATE custom_agents SET status='paused' WHERE id=?", (agent_id,))
+                self._conn.execute("UPDATE agent_runs SET status='skipped', finished_at=? WHERE id=?", (_now(), run_id))
+                self._conn.commit()
+                return
+
+            devices = _bound_devices(self._conn, fresh)
+            online = _online_bound_devices(devices)
+            if not online:
+                finished = _now()
+                reason = "Skipped: no bound device is online."
+                self._conn.execute(
+                    "UPDATE custom_agents SET status='idle', last_run_at=?, last_error=?, last_skip_reason=?, updated_at=? WHERE id=?",
+                    (finished, reason, reason, finished, agent_id),
+                )
+                self._conn.execute(
+                    "UPDATE agent_runs SET status='skipped', finished_at=?, duration_ms=?, error=? WHERE id=?",
+                    (finished, int((finished - started) * 1000), reason, run_id),
+                )
+                self._prune_runs(agent_id)
+                self._conn.commit()
+                return
+
+            # Reuse the full bound list for execution; online subset is only the gate.
+            result = execute_agent(self._conn, fresh, self._tool_executor)
+            finished = _now()
+            response_text = str(result.get("response") or "")
+            steps = result.get("steps") or []
+            actor = str(result.get("actor") or f"agent:{fresh.get('name') or fresh.get('id')}")
+            model_used = str(result.get("model") or fresh.get("model") or "").strip() or "default"
+            provider_used = str(result.get("provider") or fresh.get("provider") or "").strip() or "unknown"
+            device_ids_json = fresh.get("device_ids_json")
+
+            # Audit each tool action.
+            for step in steps:
+                try:
+                    step_args = json.dumps(step.get("args"), default=str)
+                except Exception:
+                    step_args = str(step.get("args") or "")
+                try:
+                    step_result = json.dumps(step.get("result"), default=str)
+                except Exception:
+                    step_result = str(step.get("result") or "")
+                _audit(
+                    actor,
+                    str(step.get("device") or "") or "",
+                    str(step.get("tool") or "") or "",
+                    {"agent_id": agent_id, "agent_name": fresh.get("name"), "args": step_args[:2000]},
+                    "executed",
+                    step_result[:2000],
+                    tenant=tenant,
+                )
+
+            # Summary audit entry.
+            _audit(
+                actor,
+                "",
+                "custom_agent_run",
+                {"agent_id": agent_id, "agent_name": fresh.get("name"), "device_ids_json": device_ids_json},
+                "executed",
+                json.dumps(
+                    {
+                        "provider": provider_used,
+                        "model": model_used,
+                        "response": response_text[:2000],
+                        "step_count": len(steps),
+                        "duration_ms": int((finished - started) * 1000),
+                    },
+                    default=str,
+                ),
+                tenant=tenant,
+            )
+
+            existing_memory = str(fresh.get("memory") or "").strip()
+            entry = f"[{time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime(finished))}] {response_text[:1500].strip()}"
+            new_memory = (existing_memory + "\n" + entry).strip() if existing_memory else entry
+            if len(new_memory) > 8000:
+                new_memory = new_memory[-8000:]
+            self._conn.execute(
+                "UPDATE custom_agents SET status='idle', last_run_at=?, last_result=?, last_error='', "
+                "last_skip_reason='', memory=?, consecutive_failures=0, run_count=run_count+1, updated_at=? WHERE id=?",
+                (finished, response_text[:4000], new_memory, finished, agent_id),
+            )
+            self._conn.execute(
+                "UPDATE agent_runs SET status='completed', finished_at=?, duration_ms=?, response=?, "
+                "steps_json=? WHERE id=?",
+                (finished, int((finished - started) * 1000), response_text[:20000], json.dumps(steps, default=str), run_id),
+            )
+            self._prune_runs(agent_id)
+            self._conn.commit()
+        except Exception as exc:  # noqa: BLE001 - record the failure and keep the schedule
+            finished = _now()
+            actor = f"agent:{agent.get('name') or agent.get('id')}"
+            _audit(
+                actor,
+                "",
+                "custom_agent_run",
+                {"agent_id": agent_id, "agent_name": agent.get("name"), "device_ids_json": agent.get("device_ids_json")},
+                "rejected",
+                str(exc)[:2000],
+                tenant=tenant,
+            )
+
+            # Consecutive-failure tracking + auto-pause.
+            try:
+                row = self._conn.execute(
+                    "SELECT consecutive_failures FROM custom_agents WHERE id=?", (agent_id,)
+                ).fetchone()
+                prev = int((dict(row).get("consecutive_failures") if row else 0) or 0)
+            except Exception:
+                prev = 0
+            failures = prev + 1
+            auto_paused = failures >= MAX_CONSECUTIVE_FAILURES
+
+            if auto_paused:
+                self._conn.execute(
+                    "UPDATE custom_agents SET status='paused', enabled=0, last_run_at=?, last_error=?, "
+                    "consecutive_failures=?, updated_at=? WHERE id=?",
+                    (finished, f"Auto-paused after {failures} consecutive failures: {str(exc)[:900]}", failures, finished, agent_id),
+                )
+            else:
+                self._conn.execute(
+                    "UPDATE custom_agents SET status='error', last_run_at=?, last_error=?, "
+                    "consecutive_failures=?, updated_at=? WHERE id=?",
+                    (finished, str(exc)[:1000], failures, finished, agent_id),
+                )
+
+            self._conn.execute(
+                "UPDATE agent_runs SET status='failed', finished_at=?, duration_ms=?, error=? WHERE id=?",
+                (finished, int((finished - started) * 1000), str(exc)[:2000], run_id),
+            )
+            self._prune_runs(agent_id)
+            self._conn.commit()
+
+            # Failure notification via webhook if configured.
+            try:
+                if self._failure_notifier is not None:
+                    self._failure_notifier(
+                        {
+                            "event": "agent_failed",
+                            "agent_id": agent_id,
+                            "agent_name": agent.get("name"),
+                            "error": str(exc)[:500],
+                            "consecutive_failures": failures,
+                            "auto_paused": auto_paused,
+                        }
+                    )
+            except Exception:
+                pass
+        finally:
+            with self._lock:
+                self._running.discard(agent_id)
+
+    def _prune_runs(self, agent_id: str) -> None:
+        """Keep the newest 200 runs per agent so 24/7 schedules do not grow forever."""
+        self._conn.execute(
+            "DELETE FROM agent_runs WHERE agent_id=? AND id NOT IN "
+            "(SELECT id FROM agent_runs WHERE agent_id=? ORDER BY started_at DESC LIMIT 200)",
+            (agent_id, agent_id),
+        )
+
+    def _audit_helper(self) -> None:
+        pass
+
+
+# Module-level audit indirection: routes install `audit` into app; runner needs it.
+# We resolve lazily from a module global set by install_custom_agent_routes.
+_AUDIT: Callable[..., None] | None = None
+
+
+def _audit(*args: Any, **kwargs: Any) -> None:
+    global _AUDIT
+    if _AUDIT is None:
+        # Try to import from app module state is not available; no-op.
+        return
+    try:
+        _AUDIT(*args, **kwargs)
+    except Exception:
+        pass
+
+
+def install_custom_agent_routes(app: Any, conn: Any, require_role: Any, audit: Any, runner: AgentRunner) -> None:
+    """Register /api/agents CRUD, manual run and run-history endpoints."""
+    global _AUDIT
+    _AUDIT = audit
+
+    @app.get("/api/agents")
+    def list_agents(
+        tenant: str = "default",
+        x_admin_token: str | None = Header(default=None),
+        x_session_token: str | None = Header(default=None),
+    ):
+        require_role("viewer", x_admin_token, x_session_token)
+        rows = conn.execute(
+            "SELECT * FROM custom_agents WHERE tenant=? ORDER BY created_at DESC", (tenant,)
+        ).fetchall()
+        return {"ok": True, "agents": [_serialize(conn, dict(r)) for r in rows]}
+
+    @app.post("/api/agents")
+    def create_agent(
+        body: AgentIn,
+        x_admin_token: str | None = Header(default=None),
+        x_session_token: str | None = Header(default=None),
+    ):
+        actor = require_role("admin", x_admin_token, x_session_token)
+        if not body.name.strip() or not body.instruction.strip():
+            raise HTTPException(status_code=400, detail="Name and objective cannot be empty.")
+        _validate(conn, body.provider, body.base_url, body.device_ids)
+        agent_id = uuid.uuid4().hex[:12]
+        now = _now()
+        interval = min(MAX_INTERVAL_S, max(MIN_INTERVAL_S, int(body.interval_seconds)))
+        conn.execute(
+            "INSERT INTO custom_agents (id, name, instruction, tenant, provider, model, base_url, "
+            "device_ids_json, interval_seconds, enabled, status, next_run_at, allowed_tools_json, "
+            "mcp_server_ids_json, created_at, updated_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                agent_id,
+                body.name.strip(),
+                body.instruction.strip(),
+                "default",
+                body.provider.lower().strip(),
+                (body.model or "").strip() or None,
+                (body.base_url or "").strip() or None,
+                json.dumps(body.device_ids),
+                interval,
+                1 if body.enabled else 0,
+                "idle",
+                now if body.enabled else now + interval,
+                json.dumps(body.allowed_tools or []),
+                json.dumps(body.mcp_server_ids or []),
+                now,
+                now,
+            ),
+        )
+        conn.commit()
+        audit(actor, "", "create_custom_agent", {"agent_id": agent_id, "name": body.name}, "allowed")
+        row = conn.execute("SELECT * FROM custom_agents WHERE id=?", (agent_id,)).fetchone()
+        return {"ok": True, "agent": _serialize(conn, dict(row))}
+
+    @app.patch("/api/agents/{agent_id}")
+    def update_agent(
+        agent_id: str,
+        body: AgentPatch,
+        x_admin_token: str | None = Header(default=None),
+        x_session_token: str | None = Header(default=None),
+    ):
+        actor = require_role("admin", x_admin_token, x_session_token)
+        row = conn.execute("SELECT * FROM custom_agents WHERE id=?", (agent_id,)).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Agent not found.")
+        if body.name is not None and not body.name.strip():
+            raise HTTPException(status_code=400, detail="Name cannot be empty.")
+        if body.instruction is not None and not body.instruction.strip():
+            raise HTTPException(status_code=400, detail="Objective cannot be empty.")
+        current = dict(row)
+        provider = (body.provider or current["provider"]).lower().strip()
+        base_url = body.base_url if body.base_url is not None else current.get("base_url")
+        device_ids = body.device_ids if body.device_ids is not None else json.loads(current.get("device_ids_json") or "[]")
+        if body.provider is not None or body.base_url is not None or body.device_ids is not None:
+            _validate(conn, provider, base_url, device_ids)
+        interval = (
+            min(MAX_INTERVAL_S, max(MIN_INTERVAL_S, int(body.interval_seconds)))
+            if body.interval_seconds is not None
+            else int(current["interval_seconds"])
+        )
+        enabled = current["enabled"] if body.enabled is None else (1 if body.enabled else 0)
+        next_run = current["next_run_at"]
+        if body.enabled is True and not current["enabled"]:
+            next_run = _now()
+        # Reset failure counter on manual resume.
+        reset_failures = 0 if (body.enabled is True) else current.get("consecutive_failures", 0)
+        memory = current.get("memory") if body.memory is None else body.memory
+        allowed_tools = body.allowed_tools if body.allowed_tools is not None else json.loads(current.get("allowed_tools_json") or "[]")
+        mcp_server_ids = body.mcp_server_ids if body.mcp_server_ids is not None else json.loads(current.get("mcp_server_ids_json") or "[]")
+        conn.execute(
+            "UPDATE custom_agents SET name=?, instruction=?, provider=?, model=?, base_url=?, "
+            "device_ids_json=?, interval_seconds=?, enabled=?, status=?, next_run_at=?, "
+            "memory=?, consecutive_failures=?, allowed_tools_json=?, mcp_server_ids_json=?, updated_at=? WHERE id=?",
+            (
+                (body.name or current["name"]).strip(),
+                (body.instruction or current["instruction"]).strip(),
+                provider,
+                body.model if body.model is not None else current.get("model"),
+                base_url,
+                json.dumps(device_ids),
+                interval,
+                enabled,
+                "idle" if enabled else "paused",
+                next_run,
+                memory,
+                reset_failures,
+                json.dumps(allowed_tools),
+                json.dumps(mcp_server_ids),
+                _now(),
+                agent_id,
+            ),
+        )
+        conn.commit()
+        audit(actor, "", "update_custom_agent", {"agent_id": agent_id, "enabled": bool(enabled)}, "allowed")
+        updated = conn.execute("SELECT * FROM custom_agents WHERE id=?", (agent_id,)).fetchone()
+        return {"ok": True, "agent": _serialize(conn, dict(updated))}
+
+    @app.delete("/api/agents/{agent_id}")
+    def delete_agent(
+        agent_id: str,
+        x_admin_token: str | None = Header(default=None),
+        x_session_token: str | None = Header(default=None),
+    ):
+        actor = require_role("admin", x_admin_token, x_session_token)
+        row = conn.execute("SELECT * FROM custom_agents WHERE id=?", (agent_id,)).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Agent not found.")
+        conn.execute("DELETE FROM agent_runs WHERE agent_id=?", (agent_id,))
+        conn.execute("DELETE FROM custom_agents WHERE id=?", (agent_id,))
+        conn.commit()
+        audit(actor, "", "delete_custom_agent", {"agent_id": agent_id}, "allowed")
+        return {"ok": True, "agent_id": agent_id, "status": "deleted"}
+
+    @app.post("/api/agents/{agent_id}/run")
+    def run_agent_now(
+        agent_id: str,
+        x_admin_token: str | None = Header(default=None),
+        x_session_token: str | None = Header(default=None),
+    ):
+        actor = require_role("admin", x_admin_token, x_session_token)
+        row = conn.execute("SELECT * FROM custom_agents WHERE id=?", (agent_id,)).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Agent not found.")
+        if not row["enabled"]:
+            raise HTTPException(status_code=400, detail="Start the agent before running it.")
+        conn.execute(
+            "UPDATE custom_agents SET next_run_at=?, updated_at=? WHERE id=?", (_now(), _now(), agent_id)
+        )
+        conn.commit()
+        audit(actor, "", "run_custom_agent", {"agent_id": agent_id}, "allowed")
+        return {"ok": True, "agent_id": agent_id, "status": "queued"}
+
+    @app.get("/api/agents/{agent_id}/runs")
+    def agent_runs(
+        agent_id: str,
+        limit: int = 20,
+        x_admin_token: str | None = Header(default=None),
+        x_session_token: str | None = Header(default=None),
+    ):
+        require_role("viewer", x_admin_token, x_session_token)
+        limit = min(100, max(1, int(limit)))
+        rows = conn.execute(
+            "SELECT * FROM agent_runs WHERE agent_id=? ORDER BY started_at DESC LIMIT ?",
+            (agent_id, limit),
+        ).fetchall()
+        out = []
+        for row in rows:
+            item = dict(row)
+            try:
+                item["steps"] = json.loads(item.pop("steps_json", "[]") or "[]")
+            except Exception:
+                item["steps"] = []
+            out.append(item)
+        return {"ok": True, "agent_id": agent_id, "runs": out}
+
+    @app.post("/api/agents/{agent_id}/ask")
+    def ask_agent(
+        agent_id: str,
+        body: AgentAskIn,
+        x_admin_token: str | None = Header(default=None),
+        x_session_token: str | None = Header(default=None),
+    ):
+        actor = require_role("operator", x_admin_token, x_session_token)
+        row = conn.execute("SELECT * FROM custom_agents WHERE id=?", (agent_id,)).fetchone()
+        if row is None:
+            raise HTTPException(status_code=404, detail="Agent not found.")
+        agent_dict = dict(row)
+        started = _now()
+        run_id = uuid.uuid4().hex[:12]
+        conn.execute(
+            "INSERT INTO agent_runs (id, agent_id, tenant, status, started_at) VALUES (?,?,?,'running',?)",
+            (run_id, agent_id, str(agent_dict.get("tenant") or "default"), started),
+        )
+        conn.commit()
+        try:
+            res = execute_agent(conn, agent_dict, runner._tool_executor, user_prompt=body.prompt)
+            finished = _now()
+            conn.execute(
+                "UPDATE agent_runs SET status='completed', finished_at=?, duration_ms=?, response=?, steps_json=? WHERE id=?",
+                (finished, int((finished - started) * 1000), str(res.get("response") or "")[:20000], json.dumps(res.get("steps") or [], default=str), run_id),
+            )
+            conn.execute("UPDATE custom_agents SET run_count=run_count+1, last_run_at=?, last_result=?, updated_at=? WHERE id=?",
+                         (finished, str(res.get("response") or "")[:4000], finished, agent_id))
+            conn.commit()
+            audit(actor, "", "ask_custom_agent", {"agent_id": agent_id, "prompt": body.prompt[:500]}, "allowed")
+            return {"ok": True, "run_id": run_id, **res}
+        except Exception as exc:
+            finished = _now()
+            conn.execute(
+                "UPDATE agent_runs SET status='failed', finished_at=?, duration_ms=?, error=? WHERE id=?",
+                (finished, int((finished - started) * 1000), str(exc)[:2000], run_id),
+            )
+            conn.commit()
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+class AgentAskIn(BaseModel):
+    prompt: str = Field(min_length=1, max_length=4000)
+
+
+class AgentIn(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+    instruction: str = Field(min_length=1, max_length=8000)
+    provider: str = "openai"
+    model: str | None = None
+    base_url: str | None = None
+    device_ids: list[str] = Field(default_factory=list)
+    interval_seconds: int = DEFAULT_INTERVAL_S
+    enabled: bool = True
+    allowed_tools: list[str] = Field(default_factory=list)
+    mcp_server_ids: list[str] = Field(default_factory=list)
+
+
+class AgentPatch(BaseModel):
+    name: str | None = None
+    instruction: str | None = None
+    provider: str | None = None
+    model: str | None = None
+    base_url: str | None = None
+    device_ids: list[str] | None = None
+    interval_seconds: int | None = None
+    enabled: bool | None = None
+    memory: str | None = None
+    allowed_tools: list[str] | None = None
+    mcp_server_ids: list[str] | None = None
+
+
+def _serialize(conn: Any, agent: dict[str, Any]) -> dict[str, Any]:
+    out = dict(agent)
+    try:
+        device_ids = json.loads(out.pop("device_ids_json", "[]") or "[]")
+    except Exception:
+        device_ids = []
+    out["device_ids"] = device_ids
+    out["enabled"] = bool(out.get("enabled"))
+    devices = []
+    for device_id in device_ids:
+        row = conn.execute(
+            "SELECT id, name, hostname, os, status FROM devices WHERE id=?", (device_id,)
+        ).fetchone()
+        devices.append(dict(row) if row else {"id": device_id, "name": device_id, "status": "missing"})
+    out["devices"] = devices
+
+    try:
+        allowed_tools = json.loads(out.pop("allowed_tools_json", "[]") or "[]")
+    except Exception:
+        allowed_tools = []
+    out["allowed_tools"] = allowed_tools
+
+    try:
+        mcp_server_ids = json.loads(out.pop("mcp_server_ids_json", "[]") or "[]")
+    except Exception:
+        mcp_server_ids = []
+    out["mcp_server_ids"] = mcp_server_ids
+
+    # Attach detailed MCP servers metadata
+    mcp_servers = []
+    if mcp_server_ids:
+        placeholders = ",".join("?" for _ in mcp_server_ids)
+        rows = conn.execute(
+            f"SELECT id, name, url, transport, status, tools_json, enabled FROM mcp_servers WHERE id IN ({placeholders})",
+            tuple(mcp_server_ids),
+        ).fetchall()
+        for r in rows:
+            m = dict(r)
+            try:
+                t_list = json.loads(m.pop("tools_json", "[]") or "[]")
+            except Exception:
+                t_list = []
+            m["tools_count"] = len(t_list)
+            m["tools"] = t_list
+            mcp_servers.append(m)
+    out["mcp_servers"] = mcp_servers
+
+    return out
+
+
+def _validate(conn: Any, provider: str, base_url: str | None, device_ids: list[str]) -> None:
+    p = (provider or "").lower().strip()
+    if p not in PROVIDERS:
+        raise HTTPException(status_code=400, detail=f"Unknown provider '{provider}'.")
+    if p == "custom":
+        url = (base_url or _setting(conn, "ai_custom_base_url") or os.environ.get("AI_BRIDGE_CUSTOM_BASE_URL", "")).strip()
+        if not url:
+            raise HTTPException(status_code=400, detail="Custom AI needs a base URL. Connect it in AI providers first.")
+    elif p != "ollama" and not provider_key(conn, p):
+        raise HTTPException(
+            status_code=400,
+            detail=f"No API key is connected for {p}. Save one in AI providers before creating the agent.",
+        )
+    if not device_ids:
+        raise HTTPException(status_code=400, detail="Assign at least one device to the agent.")
+    for device_id in device_ids:
+        if not conn.execute("SELECT id FROM devices WHERE id=? AND revoked=0", (device_id,)).fetchone():
+            raise HTTPException(status_code=400, detail=f"Device not found: {device_id}")

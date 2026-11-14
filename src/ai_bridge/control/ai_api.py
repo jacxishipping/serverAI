@@ -1,0 +1,2137 @@
+"""AI API & Agent Integration Layer for AI Bridge Control Plane.
+
+Provides:
+1. Tool catalog: schemas formatted for OpenAI, Anthropic Claude, Gemini, and raw JSON Schema.
+2. Synchronous tool execution: /api/ai/execute (targets Windows GUI, Linux shell, or droplet).
+3. Autonomous ReAct agent: /api/ai/agent (Bring-Your-Own-Key for OpenAI, Claude, Gemini, Groq, Ollama).
+4. OpenAI-compatible chat completions proxy: /v1/chat/completions (for LangChain, CrewAI, AutoGen, Cursor).
+"""
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+import re
+import time
+import urllib.error
+import urllib.request
+import uuid
+from typing import Any, Callable
+
+from fastapi import Header, HTTPException, Request, Response
+from fastapi.responses import JSONResponse, StreamingResponse
+from pydantic import BaseModel, Field
+
+from ..policy import TOOL_TIERS, RiskTier
+from .dispatch import dispatch
+from .mcp_client import execute_mcp_tool, format_mcp_tool_for_llm
+from .mcp_oauth import enforce_mcp_tool_policy, ensure_valid_mcp_token
+
+# Set of tools specifically for desktop GUI automation
+DESKTOP_TOOLS = {
+    "get_desktop_status",
+    "capture_desktop_screenshot",
+    "take_screenshot",
+    "launch_approved_application",
+    "perform_approved_ui_action",
+    "mouse_click",
+    "mouse_move",
+    "mouse_scroll",
+    "mouse_drag",
+    "keyboard_type",
+    "keyboard_press",
+    "list_desktop_windows",
+    "focus_window",
+    "get_screen_size",
+    "ocr_screen",
+    "click_text",
+    "click_element",
+    "list_ui_elements",
+    "set_of_marks_screenshot",
+    "wait_for_text",
+    "verify_screen_contains",
+    "press_hotkey",
+    "execute_workflow",
+}
+
+# Master tool catalog with descriptions and JSON schema properties
+TOOL_CATALOG: dict[str, dict[str, Any]] = {
+    "run_shell": {
+        "description": "Execute a shell command (bash/sh on Linux, PowerShell/cmd on Windows) on the target device or local host.",
+        "category": "shell",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "command": {"type": "string", "description": "The command line string to execute."},
+                "device": {"type": "string", "description": "Target device name or ID (e.g. 'ubuntu', 'windows-pc', or 'local')."},
+                "working_directory": {"type": "string", "description": "Optional working directory.", "default": ""},
+                "timeout": {"type": "integer", "description": "Execution timeout in seconds.", "default": 60},
+            },
+            "required": ["command"],
+        },
+    },
+    "take_screenshot": {
+        "description": "Capture the primary desktop display on a Windows workstation or GUI device. The screenshot is attached to the conversation as an image so you can inspect it; coordinates you read from it are native screen pixels.",
+        "category": "desktop",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "device": {"type": "string", "description": "Target Windows device name or ID (defaults to active Windows workstation)."},
+                "quality": {"type": "integer", "description": "JPEG compression quality (1-100).", "default": 75},
+            },
+        },
+    },
+    "mouse_click": {
+        "description": "Click the mouse at (x, y) on the target Windows machine. Use coordinates read from the latest take_screenshot image; they are native screen pixels.",
+        "category": "desktop",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "x": {"type": "integer", "description": "X coordinate in pixels."},
+                "y": {"type": "integer", "description": "Y coordinate in pixels."},
+                "button": {"type": "string", "enum": ["left", "right", "middle"], "description": "Mouse button.", "default": "left"},
+                "clicks": {"type": "integer", "description": "Number of clicks (1 for single click, 2 for double click).", "default": 1},
+                "device": {"type": "string", "description": "Target device (defaults to active Windows workstation)."},
+            },
+            "required": ["x", "y"],
+        },
+    },
+    "mouse_move": {
+        "description": "Move the mouse cursor smoothly to coordinates (x, y) on the target Windows machine.",
+        "category": "desktop",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "x": {"type": "integer", "description": "Target X coordinate."},
+                "y": {"type": "integer", "description": "Target Y coordinate."},
+                "device": {"type": "string", "description": "Target device."},
+            },
+            "required": ["x", "y"],
+        },
+    },
+    "mouse_scroll": {
+        "description": "Scroll the mouse wheel vertically or horizontally at optional (x, y) location.",
+        "category": "desktop",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "delta": {"type": "integer", "description": "Scroll delta (negative scrolls down, positive scrolls up).", "default": -120},
+                "x": {"type": "integer", "description": "Optional X coordinate before scrolling."},
+                "y": {"type": "integer", "description": "Optional Y coordinate before scrolling."},
+                "device": {"type": "string", "description": "Target device."},
+            },
+        },
+    },
+    "mouse_drag": {
+        "description": "Drag the mouse from (start_x, start_y) to (end_x, end_y) with left button held down.",
+        "category": "desktop",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "start_x": {"type": "integer", "description": "Initial X coordinate."},
+                "start_y": {"type": "integer", "description": "Initial Y coordinate."},
+                "end_x": {"type": "integer", "description": "Ending X coordinate."},
+                "end_y": {"type": "integer", "description": "Ending Y coordinate."},
+                "device": {"type": "string", "description": "Target device."},
+            },
+            "required": ["start_x", "start_y", "end_x", "end_y"],
+        },
+    },
+    "keyboard_type": {
+        "description": "Type a string of text keystrokes into the currently focused window on the target Windows machine.",
+        "category": "desktop",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "text": {"type": "string", "description": "The exact text characters to type."},
+                "device": {"type": "string", "description": "Target device."},
+            },
+            "required": ["text"],
+        },
+    },
+    "keyboard_press": {
+        "description": "Press a special key or hotkey combination (e.g. 'enter', 'tab', 'escape', 'ctrl+c', 'win+r') on the target Windows machine.",
+        "category": "desktop",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "key": {"type": "string", "description": "Key name (e.g. enter, esc, tab, backspace, win, ctrl+c, alt+f4)."},
+                "device": {"type": "string", "description": "Target device."},
+            },
+            "required": ["key"],
+        },
+    },
+    "click_text": {
+        "description": "Find and click any visible text, button, or label on the desktop screen using native OCR + UI grounding (no pixel guessing needed).",
+        "category": "desktop",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "text": {"type": "string", "description": "Text or label on screen to locate and click."},
+                "occurrence": {"type": "integer", "description": "Which occurrence to click if text appears multiple times (default 1).", "default": 1},
+                "button": {"type": "string", "description": "Mouse button: 'left', 'right', 'middle'.", "default": "left"},
+                "clicks": {"type": "integer", "description": "Number of clicks: 1 for single click, 2 for double click.", "default": 1},
+                "device": {"type": "string", "description": "Target device."},
+            },
+            "required": ["text"],
+        },
+    },
+    "click_element": {
+        "description": "Click a labeled mark (from set_of_marks_screenshot) or UI element name on screen.",
+        "category": "desktop",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "mark_id": {"type": "string", "description": "Numbered mark tag (e.g. '1', '2') from set_of_marks_screenshot."},
+                "name": {"type": "string", "description": "Name or text of the control to click."},
+                "button": {"type": "string", "description": "Mouse button: 'left' or 'right'.", "default": "left"},
+                "clicks": {"type": "integer", "description": "Click count: 1 (single) or 2 (double).", "default": 1},
+                "device": {"type": "string", "description": "Target device."},
+            },
+        },
+    },
+    "ocr_screen": {
+        "description": "Run native OCR on the current desktop screen and return recognized text lines, words, and exact bounding boxes.",
+        "category": "desktop",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "device": {"type": "string", "description": "Target device."},
+            },
+        },
+    },
+    "set_of_marks_screenshot": {
+        "description": "Capture a desktop screenshot with numbered visual tag badges ([1], [2], [3]) overlaid over interactive elements, returning the annotated image and element index.",
+        "category": "desktop",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "max_marks": {"type": "integer", "description": "Maximum elements to tag (default 40).", "default": 40},
+                "device": {"type": "string", "description": "Target device."},
+            },
+        },
+    },
+    "list_ui_elements": {
+        "description": "List visible interactive Windows controls (menus, buttons, input fields, child controls) with labels and coordinates.",
+        "category": "desktop",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "device": {"type": "string", "description": "Target device."},
+            },
+        },
+    },
+    "wait_for_text": {
+        "description": "Poll the desktop screen using native OCR until the expected text appears (e.g. waiting for page to load or window to open), or timeout.",
+        "category": "desktop",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "text": {"type": "string", "description": "Text or label to wait for on screen."},
+                "timeout_seconds": {"type": "number", "description": "Maximum seconds to wait (default 15).", "default": 15.0},
+                "poll_interval": {"type": "number", "description": "Seconds between OCR polls (default 1.0).", "default": 1.0},
+                "device": {"type": "string", "description": "Target device."},
+            },
+            "required": ["text"],
+        },
+    },
+    "verify_screen_contains": {
+        "description": "Instant one-shot assertion to verify whether specific text or button is visible on the desktop screen.",
+        "category": "desktop",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "text": {"type": "string", "description": "Text or label to verify on screen."},
+                "device": {"type": "string", "description": "Target device."},
+            },
+            "required": ["text"],
+        },
+    },
+    "press_hotkey": {
+        "description": "Press a keyboard shortcut combo on the desktop (e.g. 'ctrl+s', 'ctrl+c', 'ctrl+v', 'alt+tab', 'enter', 'esc').",
+        "category": "desktop",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "combo": {"type": "string", "description": "Hotkey combo, e.g. 'ctrl+s', 'alt+f4', 'enter'."},
+                "device": {"type": "string", "description": "Target device."},
+            },
+            "required": ["combo"],
+        },
+    },
+    "execute_workflow": {
+        "description": "Execute a multi-step autonomous plan of actions sequentially with step verification and self-correcting retry.",
+        "category": "workflow",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "steps": {
+                    "type": "array",
+                    "description": "Ordered list of step action dicts: [{'action': '...', 'args': {...}, 'name': '...'}].",
+                    "items": {"type": "object"},
+                },
+                "stop_on_failure": {"type": "boolean", "description": "Halt subsequent steps if a step fails.", "default": True},
+                "max_retries": {"type": "integer", "description": "Retries per step if an action fails.", "default": 1},
+                "device": {"type": "string", "description": "Target device."},
+            },
+            "required": ["steps"],
+        },
+    },
+    "broadcast_fleet_command": {
+        "description": "Broadcast an action or diagnostic tool across multiple fleet devices simultaneously.",
+        "category": "fleet",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "tool": {"type": "string", "description": "The tool to broadcast across nodes (e.g. 'run_shell', 'get_system_info')."},
+                "args": {"type": "object", "description": "Arguments for the tool (e.g. {'command': 'uptime'}).", "default": {}},
+                "target_os": {"type": "string", "description": "Optional OS filter ('linux', 'windows', or omit for all)."},
+                "target_device_ids": {"type": "array", "items": {"type": "string"}, "description": "Explicit list of device IDs."},
+            },
+            "required": ["tool"],
+        },
+    },
+    "list_desktop_windows": {
+        "description": "List all currently open desktop application windows, titles, and handle IDs on the target machine.",
+        "category": "desktop",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "device": {"type": "string", "description": "Target device."},
+            },
+        },
+    },
+    "focus_window": {
+        "description": "Bring an open application window to the foreground by matching its title substring.",
+        "category": "desktop",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "title": {"type": "string", "description": "Window title substring (case-insensitive)."},
+                "device": {"type": "string", "description": "Target device."},
+            },
+            "required": ["title"],
+        },
+    },
+    "get_screen_size": {
+        "description": "Get the primary monitor screen resolution (width and height in pixels) of the target machine.",
+        "category": "desktop",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "device": {"type": "string", "description": "Target device."},
+            },
+        },
+    },
+    "launch_approved_application": {
+        "description": "Launch an approved application by name or executable path on the target machine.",
+        "category": "desktop",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "app_name": {"type": "string", "description": "Application name or binary name (e.g. 'notepad', 'chrome', 'code')."},
+                "url": {"type": "string", "description": "Optional URL or file argument to pass."},
+                "device": {"type": "string", "description": "Target device."},
+            },
+            "required": ["app_name"],
+        },
+    },
+    "read_file": {
+        "description": "Read text content from any file path on the target machine (or workspace).",
+        "category": "files",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Absolute or workspace-relative path to the file."},
+                "max_chars": {"type": "integer", "description": "Maximum characters to return.", "default": 100000},
+                "device": {"type": "string", "description": "Target device."},
+            },
+            "required": ["path"],
+        },
+    },
+    "write_file": {
+        "description": "Write or overwrite text content to a file on the target machine.",
+        "category": "files",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Destination file path."},
+                "content": {"type": "string", "description": "Text content to write."},
+                "overwrite": {"type": "boolean", "description": "Allow overwriting if file already exists.", "default": False},
+                "device": {"type": "string", "description": "Target device."},
+            },
+            "required": ["path", "content"],
+        },
+    },
+    "list_workspace": {
+        "description": "List files and subdirectories within a directory path on the target device.",
+        "category": "files",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "relative_directory": {"type": "string", "description": "Directory path (defaults to workspace root).", "default": "."},
+                "device": {"type": "string", "description": "Target device."},
+            },
+        },
+    },
+    "list_devices": {
+        "description": "List all enrolled fleet devices (Windows workstations, Linux servers, WSL) and the local host with online status and system info.",
+        "category": "system",
+        "parameters": {
+            "type": "object",
+            "properties": {},
+        },
+    },
+    "get_device_status": {
+        "description": "Get detailed heartbeat, OS, policy, and tool availability status for a specific device.",
+        "category": "system",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "device_id": {"type": "string", "description": "Device ID or friendly name.", "default": "local"},
+            },
+        },
+    },
+    "get_system_info": {
+        "description": "Get operating system details, machine architecture, Python version, and workspace paths.",
+        "category": "system",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "device": {"type": "string", "description": "Target device."},
+            },
+        },
+    },
+    "get_resource_usage": {
+        "description": "Get real-time CPU percentage, RAM memory usage, and uptime from the target device.",
+        "category": "system",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "device": {"type": "string", "description": "Target device."},
+            },
+        },
+    },
+    "get_disk_usage": {
+        "description": "Get total, used, and free disk space on the primary filesystem.",
+        "category": "system",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "device": {"type": "string", "description": "Target device."},
+            },
+        },
+    },
+    "get_memory_usage": {
+        "description": "Get detailed physical and virtual RAM memory statistics.",
+        "category": "system",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "device": {"type": "string", "description": "Target device."},
+            },
+        },
+    },
+    "get_network_info": {
+        "description": "Get network interface configurations, MAC addresses, and active IP addresses.",
+        "category": "system",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "device": {"type": "string", "description": "Target device."},
+            },
+        },
+    },
+    "list_processes": {
+        "description": "List top running system processes sorted by CPU and memory usage.",
+        "category": "system",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "limit": {"type": "integer", "description": "Maximum processes to return.", "default": 50},
+                "device": {"type": "string", "description": "Target device."},
+            },
+        },
+    },
+    "get_service_status": {
+        "description": "Check if a background system service (e.g. nginx, ssh, docker, postgresql) is running.",
+        "category": "system",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "service": {"type": "string", "description": "Service name."},
+                "device": {"type": "string", "description": "Target device."},
+            },
+            "required": ["service"],
+        },
+    },
+    "list_docker_containers": {
+        "description": "List active Docker containers, images, status, and exposed ports on the target machine.",
+        "category": "system",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "device": {"type": "string", "description": "Target device."},
+            },
+        },
+    },
+    "install_package": {
+        "description": "Install or update a software package using the system package manager (apt, pip, npm, winget, choco).",
+        "category": "package",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "package_id": {"type": "string", "description": "Package name to install."},
+                "version": {"type": "string", "description": "Optional package version."},
+                "device": {"type": "string", "description": "Target device."},
+            },
+            "required": ["package_id"],
+        },
+    },
+    "git_status": {
+        "description": "Get git repository status (staged, modified, untracked files) in the target directory.",
+        "category": "git",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "relative_directory": {"type": "string", "description": "Path to git repository directory.", "default": "."},
+                "device": {"type": "string", "description": "Target device."},
+            },
+        },
+    },
+    "git_diff": {
+        "description": "Get git diff output showing pending unstaged and staged code modifications.",
+        "category": "git",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "relative_directory": {"type": "string", "description": "Path to git repository directory.", "default": "."},
+                "device": {"type": "string", "description": "Target device."},
+            },
+        },
+    },
+    "run_project_tests": {
+        "description": "Run the project test suite (e.g. pytest, npm test, cargo test) and return test output.",
+        "category": "diagnostic",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "test_command": {"type": "string", "description": "Test command (e.g. 'pytest', 'npm test').", "default": "pytest"},
+                "timeout": {"type": "integer", "description": "Execution timeout in seconds.", "default": 120},
+                "device": {"type": "string", "description": "Target device."},
+            },
+        },
+    },
+}
+
+# Add aliases and additional mapped tools
+from ..connectors import microsoft365 as _m365  # noqa: E402
+
+TOOL_CATALOG.update(_m365.TOOL_SPECS)
+
+TOOL_CATALOG["capture_desktop_screenshot"] = {
+    **TOOL_CATALOG["take_screenshot"],
+    "description": "Alias for take_screenshot: captures desktop display on target device.",
+}
+
+_IMAGE_FIELD_KEYS = ("image_base64", "base64_data", "screenshot")
+
+
+def _extract_image(res: Any) -> tuple[str, str, int | None, int | None] | None:
+    """Find a base64 screenshot in a tool result (local or remote task wrapper).
+
+    Returns (base64, mime, width, height) using the encoded image dimensions
+    when available. Handles results nested under a ``result`` key, which is how
+    remote device tasks are wrapped.
+    """
+    if not isinstance(res, dict):
+        return None
+    candidates: list[dict[str, Any]] = [res]
+    inner = res.get("result")
+    # Remote device tasks wrap the tool result one or two levels deep.
+    for _ in range(3):
+        if not isinstance(inner, dict):
+            break
+        candidates.append(inner)
+        inner = inner.get("result")
+    for node in candidates:
+        for key in _IMAGE_FIELD_KEYS:
+            raw = node.get(key)
+            if not raw or not isinstance(raw, str):
+                continue
+            b64 = raw
+            mime = str(node.get("mime_type") or res.get("mime_type") or "image/jpeg")
+            if b64.startswith("data:"):
+                header, _, b64 = b64.partition(",")
+                if ";base64" in header:
+                    mime = header[5:].split(";", 1)[0] or mime
+            if not b64.strip():
+                continue
+            width = node.get("image_width") or node.get("width") or node.get("orig_width")
+            height = node.get("image_height") or node.get("height") or node.get("orig_height")
+            try:
+                width = int(width) if width is not None else None
+                height = int(height) if height is not None else None
+            except (TypeError, ValueError):
+                width = height = None
+            return b64.strip(), mime, width, height
+    return None
+
+
+def _strip_image_fields(res: Any) -> Any:
+    """Remove base64 image payloads so tool text stays small for the model."""
+    if isinstance(res, dict):
+        return {
+            k: _strip_image_fields(v)
+            for k, v in res.items()
+            if k not in _IMAGE_FIELD_KEYS and k not in ("mime_type", "size_bytes")
+        }
+    if isinstance(res, list):
+        return [_strip_image_fields(v) for v in res]
+    return res
+
+
+def _drop_images(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Return messages with image parts replaced by their text, for text-only models."""
+    cleaned: list[dict[str, Any]] = []
+    for msg in messages:
+        content = msg.get("content")
+        if isinstance(content, list):
+            texts = [p.get("text", "") for p in content if isinstance(p, dict) and p.get("type") == "text"]
+            msg = {**msg, "content": "\n".join(t for t in texts if t)}
+        cleaned.append(msg)
+    return cleaned
+
+
+def _has_image_parts(messages: list[dict[str, Any]]) -> bool:
+    for msg in messages:
+        content = msg.get("content")
+        if isinstance(content, list) and any(
+            isinstance(p, dict) and p.get("type") == "image_url" for p in content
+        ):
+            return True
+    return False
+
+
+ANTHROPIC_VERSION = "2023-06-01"
+
+
+def _anthropic_append(out: list[dict[str, Any]], role: str, parts: list[dict[str, Any]]) -> None:
+    """Append a message, merging with the previous one when roles repeat.
+
+    Anthropic requires alternating user/assistant turns, but our OpenAI-style
+    history can contain consecutive user messages (tool results followed by
+    screenshot images).
+    """
+    if out and out[-1]["role"] == role:
+        out[-1]["content"].extend(parts)
+    else:
+        out.append({"role": role, "content": parts})
+
+
+def _anthropic_request_body(
+    model: str,
+    messages: list[dict[str, Any]],
+    tools_spec: list[dict[str, Any]],
+    temperature: float = 0.2,
+    max_tokens: int = 4096,
+) -> dict[str, Any]:
+    """Translate OpenAI-style chat history + tool specs to the Messages API."""
+    system_parts: list[str] = []
+    converted: list[dict[str, Any]] = []
+    for msg in messages:
+        role = msg.get("role")
+        if role == "system":
+            if msg.get("content"):
+                system_parts.append(str(msg["content"]))
+            continue
+        if role == "tool":
+            _anthropic_append(converted, "user", [{
+                "type": "tool_result",
+                "tool_use_id": msg.get("tool_call_id"),
+                "content": msg.get("content") or "",
+            }])
+            continue
+        if role == "assistant":
+            parts: list[dict[str, Any]] = []
+            if msg.get("content"):
+                parts.append({"type": "text", "text": str(msg["content"])})
+            for tc in msg.get("tool_calls") or []:
+                fn = tc.get("function") or {}
+                try:
+                    args = json.loads(fn.get("arguments") or "{}")
+                except Exception:
+                    args = {}
+                parts.append({
+                    "type": "tool_use",
+                    "id": tc.get("id") or f"toolu_{uuid.uuid4().hex[:12]}",
+                    "name": fn.get("name") or "tool",
+                    "input": args if isinstance(args, dict) else {},
+                })
+            if parts:
+                _anthropic_append(converted, "assistant", parts)
+            continue
+        # user message: plain text or multimodal content parts
+        content = msg.get("content")
+        parts = []
+        if isinstance(content, str):
+            parts.append({"type": "text", "text": content})
+        else:
+            for part in content or []:
+                if not isinstance(part, dict):
+                    continue
+                if part.get("type") == "text":
+                    parts.append({"type": "text", "text": part.get("text") or ""})
+                elif part.get("type") == "image_url":
+                    url = str((part.get("image_url") or {}).get("url") or "")
+                    header, _, b64 = url.partition(",")
+                    mime = "image/jpeg"
+                    if header.startswith("data:") and ";" in header:
+                        mime = header[5:].split(";", 1)[0] or mime
+                    if b64:
+                        parts.append({"type": "image", "source": {"type": "base64", "media_type": mime, "data": b64}})
+        if parts:
+            _anthropic_append(converted, "user", parts)
+
+    body: dict[str, Any] = {
+        "model": model,
+        "messages": converted,
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+    }
+    if system_parts:
+        body["system"] = "\n\n".join(system_parts)
+    if tools_spec:
+        body["tools"] = [
+            {
+                "name": (t.get("function") or {}).get("name") or "tool",
+                "description": (t.get("function") or {}).get("description") or "",
+                "input_schema": (t.get("function") or {}).get("parameters") or {"type": "object", "properties": {}},
+            }
+            for t in tools_spec
+        ]
+    return body
+
+
+def _anthropic_response_message(data: dict[str, Any]) -> dict[str, Any]:
+    """Convert a Messages API response into an OpenAI-style assistant message."""
+    texts: list[str] = []
+    tool_calls: list[dict[str, Any]] = []
+    for block in data.get("content") or []:
+        if not isinstance(block, dict):
+            continue
+        if block.get("type") == "text":
+            texts.append(block.get("text") or "")
+        elif block.get("type") == "tool_use":
+            tool_calls.append({
+                "id": block.get("id"),
+                "type": "function",
+                "function": {
+                    "name": block.get("name"),
+                    "arguments": json.dumps(block.get("input") or {}),
+                },
+            })
+    message: dict[str, Any] = {"role": "assistant", "content": "\n".join(t for t in texts if t)}
+    if tool_calls:
+        message["tool_calls"] = tool_calls
+    return message
+
+
+def _post_anthropic(
+    base_url: str,
+    api_key: str,
+    model: str,
+    messages: list[dict[str, Any]],
+    tools_spec: list[dict[str, Any]],
+    temperature: float = 0.2,
+    timeout: int = 60,
+) -> dict[str, Any]:
+    """Call the native Anthropic Messages API and return an OpenAI-style message."""
+    request = urllib.request.Request(
+        f"{base_url.rstrip('/')}/messages",
+        data=json.dumps(_anthropic_request_body(model, messages, tools_spec, temperature)).encode("utf-8"),
+        headers={
+            "Content-Type": "application/json",
+            "x-api-key": api_key,
+            "anthropic-version": ANTHROPIC_VERSION,
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        return _anthropic_response_message(json.loads(response.read().decode("utf-8")))
+
+
+def _image_user_message(images: list[tuple[str, str, int | None, int | None, str]]) -> dict[str, Any]:
+    """Build an OpenAI-compatible user message carrying screenshots as image parts."""
+    parts: list[dict[str, Any]] = [
+        {
+            "type": "text",
+            "text": (
+                "The attached screenshot(s) show the current desktop. Coordinates are in "
+                "native screen pixels; describe what you see before acting."
+            ),
+        }
+    ]
+    for b64, mime, width, height, label in images:
+        if width and height:
+            parts.append({"type": "text", "text": f"{label}: {width}x{height} px"})
+        else:
+            parts.append({"type": "text", "text": f"{label}: screenshot"})
+        parts.append({
+            "type": "image_url",
+            "image_url": {"url": f"data:{mime};base64,{b64}", "detail": "high"},
+        })
+    return {"role": "user", "content": parts}
+
+
+def build_tool_specs(
+    tool_format: str = "raw",
+    device_os: str | None = None,
+    category: str | None = None,
+) -> list[dict[str, Any]] | dict[str, Any]:
+    """Convert TOOL_CATALOG into the requested format (raw, openai, anthropic, gemini)."""
+    fmt = (tool_format or "raw").lower()
+    results = []
+
+    for name, meta in TOOL_CATALOG.items():
+        # Optional category filter
+        if category and meta.get("category") != category.lower():
+            continue
+
+        # Optional OS filter
+        is_desktop = name in DESKTOP_TOOLS
+        if device_os:
+            os_low = device_os.lower()
+            if "linux" in os_low and is_desktop and name not in {"get_desktop_status"}:
+                # Skip desktop tools for headless Linux devices unless specifically queried
+                continue
+
+        desc = meta["description"]
+        params = meta.get("parameters", {"type": "object", "properties": {}})
+        tier = TOOL_TIERS.get(name, RiskTier.SENSITIVE).value
+
+        if fmt == "openai":
+            results.append({
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "description": f"[Tier {tier}] {desc}",
+                    "parameters": params,
+                },
+            })
+        elif fmt == "anthropic":
+            results.append({
+                "name": name,
+                "description": f"[Tier {tier}] {desc}",
+                "input_schema": params,
+            })
+        elif fmt == "gemini":
+            results.append({
+                "name": name,
+                "description": f"[Tier {tier}] {desc}",
+                "parameters": params,
+            })
+        else:
+            # raw format
+            results.append({
+                "name": name,
+                "description": desc,
+                "category": meta.get("category", "general"),
+                "tier": tier,
+                "parameters": params,
+            })
+
+    return results
+
+
+def resolve_device_record(conn, target: str | None, tenant: str = "default") -> dict | None:
+    """Resolve a target device string (ID, name, hostname, prefix) to device record."""
+    if not target or str(target).strip().lower() in ("local", "host", "droplet"):
+        return None
+    raw = str(target).strip()
+    low = raw.lower()
+
+    # 1. Exact ID
+    row = conn.execute("SELECT * FROM devices WHERE id=? AND tenant=? AND revoked=0", (raw, tenant)).fetchone()
+    if row:
+        return dict(row)
+
+    # 2. Exact Name or Hostname (case-insensitive)
+    row = conn.execute(
+        "SELECT * FROM devices WHERE (LOWER(name)=? OR LOWER(hostname)=?) AND tenant=? AND revoked=0",
+        (low, low, tenant),
+    ).fetchone()
+    if row:
+        return dict(row)
+
+    # 3. ID Prefix
+    rows = conn.execute(
+        "SELECT * FROM devices WHERE id LIKE ? AND tenant=? AND revoked=0",
+        (f"{raw}%", tenant),
+    ).fetchall()
+    if len(rows) == 1:
+        return dict(rows[0])
+
+    return None
+
+
+def find_default_windows_device(conn, tenant: str = "default") -> dict | None:
+    """Find the primary active Windows device in the fleet."""
+    # 1. Online Windows workstation
+    rows = conn.execute("SELECT * FROM devices WHERE tenant=? AND revoked=0 ORDER BY last_seen DESC", (tenant,)).fetchall()
+    for r in rows:
+        os_str = (r["os"] or "").lower()
+        if "win" in os_str and r["status"] == "online":
+            return dict(r)
+    # 2. Any online device with desktop_enabled in policy
+    for r in rows:
+        if r["status"] == "online":
+            try:
+                p = json.loads(r["policy_json"] or "{}")
+                if p.get("desktop_enabled"):
+                    return dict(r)
+            except Exception:
+                pass
+    # 3. Any Windows machine
+    for r in rows:
+        if "win" in (r["os"] or "").lower():
+            return dict(r)
+    return None
+
+
+class AIExecuteIn(BaseModel):
+    tool: str
+    device: str | None = None
+    args: dict = Field(default_factory=dict)
+    timeout: int = 30
+    tenant: str = "default"
+
+
+class AIAgentIn(BaseModel):
+    prompt: str
+    device: str | None = None
+    provider: str = "openai"  # openai | anthropic | gemini | groq | deepseek | ollama | auto
+    model: str | None = None
+    api_key: str | None = None
+    base_url: str | None = None
+    max_steps: int = 8
+    temperature: float = 0.2
+    tenant: str = "default"
+
+
+class ChatCompletionMessage(BaseModel):
+    role: str
+    content: str | None = None
+    name: str | None = None
+
+
+class ChatCompletionIn(BaseModel):
+    model: str = "ai-bridge-agent"
+    messages: list[ChatCompletionMessage]
+    stream: bool = False
+    temperature: float | None = 0.7
+    max_tokens: int | None = None
+    device: str | None = None
+    api_key: str | None = None
+
+
+class AISettingsIn(BaseModel):
+    provider: str = "openai"  # openai | anthropic | gemini | groq | deepseek | ollama | custom
+    model: str | None = None
+    api_key: str | None = None
+    base_url: str | None = None
+    test_connection: bool = True
+    clear: bool = False
+
+
+class ChatMessage(BaseModel):
+    role: str
+    content: str | None = None
+    name: str | None = None
+    screenshot: str | None = None
+
+
+class AIChatIn(BaseModel):
+    messages: list[ChatMessage]
+    provider: str | None = None
+    model: str | None = None
+    api_key: str | None = None
+    base_url: str | None = None
+    device: str | None = "auto"
+    tenant: str = "default"
+
+
+def mask_key(k: str) -> str:
+    if not k:
+        return ""
+    if len(k) <= 8:
+        return "****"
+    return f"{k[:7]}...{k[-4:]}"
+
+
+def _normalize_custom_base_url(raw_url: str | None) -> str:
+    url = (raw_url or "").strip().rstrip("/")
+    for suffix in ("/chat/completions", "/completions", "/models"):
+        if url.lower().endswith(suffix):
+            url = url[: -len(suffix)].rstrip("/")
+    return url
+
+
+def validate_llm_key(
+    provider: str,
+    api_key: str,
+    base_url: str | None = None,
+    model: str | None = None,
+) -> tuple[bool, str]:
+    """Test connection with the provider to verify the API key is active."""
+    p = provider.lower().strip()
+    key = api_key.strip()
+    if p == "ollama":
+        return True, "Ollama local provider selected."
+    if p == "custom":
+        url = _normalize_custom_base_url(base_url)
+        if not url:
+            return False, "Base URL is required for custom AI provider (e.g. https://openrouter.ai/api/v1)."
+        if not (url.startswith("http://") or url.startswith("https://")):
+            return False, "Base URL must start with http:// or https://"
+
+        headers = {"User-Agent": "AI-Bridge/0.3"}
+        if key:
+            headers["Authorization"] = f"Bearer {key}"
+
+        models_auth_error: str | None = None
+        # 1. Probe /models
+        try:
+            req = urllib.request.Request(f"{url}/models", headers=headers)
+            with urllib.request.urlopen(req, timeout=12) as resp:
+                if 200 <= resp.status < 300:
+                    return True, "Custom AI endpoint verified successfully via /models."
+        except urllib.error.HTTPError as err:
+            if err.code in (401, 403):
+                err_msg = err.read().decode("utf-8", errors="replace") if err.fp else ""
+                models_auth_error = f"Custom AI endpoint rejected key (HTTP {err.code}): {err_msg[:160]}"
+            # Continue to /chat/completions probe in case /models is not exposed
+        except Exception:
+            pass
+
+        # 2. Probe /chat/completions
+        try:
+            test_payload = {
+                "model": model or "gpt-4o-mini",
+                "messages": [{"role": "user", "content": "ping"}],
+                "max_tokens": 1,
+            }
+            req2 = urllib.request.Request(
+                f"{url}/chat/completions",
+                data=json.dumps(test_payload).encode("utf-8"),
+                headers={**headers, "Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req2, timeout=12) as resp:
+                if 200 <= resp.status < 300:
+                    return True, "Custom AI endpoint verified successfully via /chat/completions."
+        except urllib.error.HTTPError as err:
+            err_msg = err.read().decode("utf-8", errors="replace") if err.fp else ""
+            if err.code in (401, 403):
+                return False, f"Custom AI endpoint rejected key (HTTP {err.code}): {err_msg[:160]}"
+            if err.code in (400, 404, 422):
+                if models_auth_error and err.code == 404:
+                    return False, models_auth_error
+                return True, "Custom AI endpoint reached and authenticated."
+            return False, f"Custom AI endpoint returned HTTP {err.code}: {err_msg[:160]}"
+        except Exception as exc:
+            if models_auth_error:
+                return False, models_auth_error
+            return False, f"Could not reach Custom AI endpoint at {url}: {exc}"
+
+        return True, "Custom AI endpoint connection configured."
+
+    if not key:
+        return False, "API key cannot be empty."
+
+    try:
+        if p == "openai":
+            req = urllib.request.Request(
+                "https://api.openai.com/v1/models",
+                headers={"Authorization": f"Bearer {key}", "User-Agent": "AI-Bridge/0.3"}
+            )
+            with urllib.request.urlopen(req, timeout=12) as resp:
+                if 200 <= resp.status < 300:
+                    return True, "OpenAI connection verified successfully."
+        elif p == "groq":
+            req = urllib.request.Request(
+                "https://api.groq.com/openai/v1/models",
+                headers={"Authorization": f"Bearer {key}", "User-Agent": "AI-Bridge/0.3"}
+            )
+            with urllib.request.urlopen(req, timeout=12) as resp:
+                if 200 <= resp.status < 300:
+                    return True, "Groq connection verified successfully."
+        elif p == "deepseek":
+            req = urllib.request.Request(
+                "https://api.deepseek.com/models",
+                headers={"Authorization": f"Bearer {key}", "User-Agent": "AI-Bridge/0.3"}
+            )
+            with urllib.request.urlopen(req, timeout=12) as resp:
+                if 200 <= resp.status < 300:
+                    return True, "DeepSeek connection verified successfully."
+        elif p == "gemini":
+            req = urllib.request.Request(
+                f"https://generativelanguage.googleapis.com/v1beta/models?key={key}",
+                headers={"User-Agent": "AI-Bridge/0.3"}
+            )
+            with urllib.request.urlopen(req, timeout=12) as resp:
+                if 200 <= resp.status < 300:
+                    return True, "Google Gemini connection verified successfully."
+        elif p == "anthropic":
+            payload = {
+                "model": "claude-3-5-sonnet-20241022",
+                "max_tokens": 1,
+                "messages": [{"role": "user", "content": "ping"}]
+            }
+            req = urllib.request.Request(
+                "https://api.anthropic.com/v1/messages",
+                data=json.dumps(payload).encode("utf-8"),
+                headers={
+                    "x-api-key": key,
+                    "anthropic-version": "2023-06-01",
+                    "content-type": "application/json",
+                    "User-Agent": "AI-Bridge/0.3"
+                },
+                method="POST"
+            )
+            with urllib.request.urlopen(req, timeout=12) as resp:
+                if 200 <= resp.status < 300:
+                    return True, "Anthropic Claude connection verified successfully."
+        elif p == "ollama":
+            return True, "Ollama connection configured."
+        else:
+            return False, f"Unsupported provider: {p}"
+    except urllib.error.HTTPError as err:
+        err_msg = err.read().decode("utf-8") if err.fp else ""
+        try:
+            err_json = json.loads(err_msg)
+            msg = err_json.get("error", {}).get("message") or err_json.get("message") or err_msg
+        except Exception:
+            msg = err_msg or str(err)
+        return False, f"Provider rejected key (HTTP {err.code}): {msg[:180]}"
+    except Exception as exc:
+        return False, f"Could not reach provider: {exc}"
+    return False, "Validation failed."
+
+
+def extract_bearer_token(auth_header: str | None) -> str | None:
+    if not auth_header:
+        return None
+    header = auth_header.strip()
+    if header.lower().startswith("bearer "):
+        return header[7:].strip() or None
+    return header or None
+
+
+def attach_ai_routes(
+    app,
+    conn,
+    task_cond,
+    notify_tasks: Callable[[], None],
+    auth_context: Callable,
+    require_role: Callable,
+    get_effective_device_policy: Callable,
+    audit: Callable,
+):
+    """Attach the complete AI API integration routes to the control plane FastAPI app."""
+
+    def _resolve_auth(req: Request, x_admin_token: str | None, x_session_token: str | None):
+        """Unified auth checking supporting standard Authorization: Bearer <token>."""
+        auth_hdr = req.headers.get("authorization")
+        bearer = extract_bearer_token(auth_hdr)
+
+        # Check session token
+        eff_session = x_session_token or bearer
+        eff_admin = x_admin_token or bearer
+
+        # Let auth_context determine actor and role
+        try:
+            return auth_context(eff_admin, eff_session)
+        except Exception:
+            # Check if bearer matches legacy admin token directly
+            admin_tok = getattr(app.state, "admin_token", "")
+            if bearer and admin_tok and bearer == admin_tok:
+                return "admin-token", "admin"
+            raise HTTPException(status_code=401, detail="Authentication required (provide Bearer token, X-Admin-Token, or X-Session-Token).")
+
+    # 1. Tools Catalog Endpoint
+    @app.get("/api/ai/tools")
+    def get_ai_tools(
+        req: Request,
+        format: str = "raw",
+        device: str | None = None,
+        category: str | None = None,
+        x_admin_token: str | None = Header(default=None),
+        x_session_token: str | None = Header(default=None),
+    ):
+        """Return available AI tools in raw JSON Schema, OpenAI, Anthropic Claude, or Gemini format."""
+        _resolve_auth(req, x_admin_token, x_session_token)
+
+        dev_os = None
+        if device and device.lower() not in ("local", "host"):
+            dev_rec = resolve_device_record(conn, device)
+            if dev_rec:
+                dev_os = dev_rec.get("os")
+
+        tools_list = build_tool_specs(tool_format=format, device_os=dev_os, category=category)
+        return {"ok": True, "format": format, "count": len(tools_list), "tools": tools_list}
+
+    # 2. Synchronous AI Tool Execution Endpoint
+    @app.post("/api/ai/execute")
+    async def execute_ai_tool(
+        body: AIExecuteIn,
+        req: Request,
+        x_admin_token: str | None = Header(default=None),
+        x_session_token: str | None = Header(default=None),
+    ):
+        """Direct synchronous execution of any tool on any device.
+
+        Wait for the result and return it in a single response.
+        """
+        actor, role = _resolve_auth(req, x_admin_token, x_session_token)
+        # A viewer may read the fleet but must never execute a tool: the local
+        # branch below runs on the control-plane host itself.
+        require_role("operator", x_admin_token, x_session_token, req.headers.get("authorization"))
+        if app.state.emergency_stop:
+            raise HTTPException(status_code=403, detail="Emergency stop is active; no tool executions accepted.")
+
+        tool = body.tool.strip()
+        tier = TOOL_TIERS.get(tool)
+        if tier is None:
+            raise HTTPException(status_code=400, detail=f"Unknown tool: '{tool}'. Query /api/ai/tools for valid tools.")
+
+        # Determine target device
+        target = body.device
+        if (not target or target.lower() in ("auto", "windows")) and tool in DESKTOP_TOOLS:
+            win_dev = find_default_windows_device(conn, body.tenant)
+            if win_dev:
+                target = win_dev["id"]
+
+        is_local = not target or target.lower() in ("local", "host", "droplet")
+        dev_rec = None if is_local else resolve_device_record(conn, target, body.tenant)
+
+        if not is_local and dev_rec is None:
+            # Device requested but not found
+            devices = conn.execute("SELECT id, name, hostname, os, status FROM devices WHERE tenant=? AND revoked=0", (body.tenant,)).fetchall()
+            avail = [f"'{d['name']}' (id: {d['id']}, os: {d['os']}, status: {d['status']})" for d in devices]
+            raise HTTPException(
+                status_code=404,
+                detail=f"Device '{target}' not found in tenant '{body.tenant}'. Available: [{', '.join(avail) if avail else 'None'}], or use 'local'.",
+            )
+
+        start_time = time.time()
+
+        # Handle local execution
+        if is_local:
+            try:
+                res = dispatch(tool, body.args, is_admin=(role == "admin"))
+                duration_ms = int((time.time() - start_time) * 1000)
+                audit(actor, "local", tool, body.args, "completed", tenant=body.tenant)
+                return {
+                    "ok": True,
+                    "status": "completed",
+                    "tool": tool,
+                    "device": "local",
+                    "device_id": "local",
+                    "result": res,
+                    "duration_ms": duration_ms,
+                }
+            except PermissionError as exc:
+                audit(actor, "local", tool, body.args, "denied", tenant=body.tenant)
+                return JSONResponse(status_code=403, content={"ok": False, "status": "denied", "tool": tool, "error": str(exc)})
+            except Exception as exc:
+                audit(actor, "local", tool, body.args, "failed", tenant=body.tenant)
+                return JSONResponse(status_code=500, content={"ok": False, "status": "failed", "tool": tool, "error": str(exc)})
+
+        # Remote device execution via tasks table
+        eff_policy = get_effective_device_policy(dev_rec)
+        if tool in eff_policy.get("denied_tools", []):
+            raise HTTPException(status_code=403, detail=f"Tool '{tool}' is disabled by device policy for '{dev_rec['name']}'.")
+        if eff_policy.get("allowed_tools") is not None and tool not in eff_policy["allowed_tools"]:
+            raise HTTPException(status_code=403, detail=f"Tool '{tool}' is not in the allowed tools list for device '{dev_rec['name']}'.")
+
+        # Approval evaluation
+        is_unrestricted = bool(eff_policy.get("unrestricted", False))
+        max_unattended = int(eff_policy.get("max_tier_unattended", 2))
+        allow_t3 = bool(eff_policy.get("allow_tier3", False))
+        needs_approval = False
+
+        if not is_unrestricted:
+            if tier.value >= 4:
+                if max_unattended < 4:
+                    needs_approval = True
+            elif tier.value == 3:
+                if not (allow_t3 or max_unattended >= 3):
+                    needs_approval = True
+            elif tier.value > max_unattended:
+                needs_approval = True
+
+        task_id = uuid.uuid4().hex[:12]
+        approval_id = None
+
+        if needs_approval:
+            approval_id = uuid.uuid4().hex[:12]
+            approval_ttl = max(60, int(os.environ.get("AI_BRIDGE_APPROVAL_TTL_SECONDS", "3600")))
+            policy_row = conn.execute("SELECT MAX(version) AS version FROM policies").fetchone()
+            policy_version = policy_row["version"] or 0
+            conn.execute(
+                "INSERT INTO approvals (id, task_id, tool, reason, created_at, expires_at, policy_version) VALUES (?,?,?,?,?,?,?)",
+                (approval_id, task_id, tool, f"Tier-{tier.value} operation requires human approval.", time.time(), time.time() + approval_ttl, policy_version),
+            )
+            conn.execute(
+                "INSERT INTO tasks (id, device_id, tenant, tool, args_json, tier, status, approval_id, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (task_id, dev_rec["id"], body.tenant, tool, json.dumps(body.args), tier.value, "needs_approval", approval_id, time.time(), time.time()),
+            )
+            conn.commit()
+            audit(actor, dev_rec["id"], tool, body.args, "needs_approval", tenant=body.tenant)
+
+            return {
+                "ok": False,
+                "status": "needs_approval",
+                "tool": tool,
+                "device_id": dev_rec["id"],
+                "device_name": dev_rec["name"],
+                "task_id": task_id,
+                "approval_id": approval_id,
+                "tier": tier.value,
+                "note": "Operation requires human approval in the AI Bridge dashboard or via POST /api/approvals/{approval_id}.",
+            }
+
+        # Queue task for agent
+        conn.execute(
+            "INSERT INTO tasks (id, device_id, tenant, tool, args_json, tier, status, approval_id, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (task_id, dev_rec["id"], body.tenant, tool, json.dumps(body.args), tier.value, "queued", None, time.time(), time.time()),
+        )
+        conn.commit()
+        audit(actor, dev_rec["id"], tool, body.args, "queued", tenant=body.tenant)
+        notify_tasks()
+
+        # Await completion
+        wait_seconds = max(1, min(int(body.timeout or 30), 120))
+        deadline = time.time() + wait_seconds
+
+        while time.time() < deadline:
+            task_row = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
+            if task_row and task_row["status"] in ("completed", "failed", "cancelled", "timed_out"):
+                duration_ms = int((time.time() - start_time) * 1000)
+                st = task_row["status"]
+                raw_res = task_row["result"] or ""
+                # Parse JSON if possible
+                try:
+                    parsed_res = json.loads(raw_res)
+                except Exception:
+                    parsed_res = raw_res
+
+                if st == "completed":
+                    return {
+                        "ok": True,
+                        "status": "completed",
+                        "tool": tool,
+                        "device_id": dev_rec["id"],
+                        "device_name": dev_rec["name"],
+                        "task_id": task_id,
+                        "result": parsed_res,
+                        "duration_ms": duration_ms,
+                    }
+                else:
+                    return {
+                        "ok": False,
+                        "status": st,
+                        "tool": tool,
+                        "device_id": dev_rec["id"],
+                        "device_name": dev_rec["name"],
+                        "task_id": task_id,
+                        "error": parsed_res,
+                        "duration_ms": duration_ms,
+                    }
+
+            rem = deadline - time.time()
+            if rem <= 0:
+                break
+            await asyncio.sleep(min(0.1, rem))
+
+        # Still running
+        return {
+            "ok": False,
+            "status": "running",
+            "tool": tool,
+            "device_id": dev_rec["id"],
+            "device_name": dev_rec["name"],
+            "task_id": task_id,
+            "note": f"Task submitted to '{dev_rec['name']}' is still executing. Retrieve final result with GET /api/tasks/{task_id}.",
+        }
+
+    # 3. Autonomous AI Agent Loop Endpoint
+    @app.post("/api/ai/agent")
+    async def run_autonomous_agent(
+        body: AIAgentIn,
+        req: Request,
+        x_admin_token: str | None = Header(default=None),
+        x_session_token: str | None = Header(default=None),
+        on_event: Callable[[dict[str, Any]], None] | None = None,
+    ):
+        """Autonomous ReAct agent that accepts a natural language instruction,
+        calls tools across your connected devices, and returns the final answer.
+        """
+        actor, role = _resolve_auth(req, x_admin_token, x_session_token)
+
+        # Determine LLM Provider, Model and API Key
+        provider = (body.provider or "").lower().strip()
+        if not provider or provider == "auto":
+            def_p = conn.execute("SELECT value FROM settings WHERE key='ai_default_provider'").fetchone()
+            provider = (def_p["value"] if def_p and def_p["value"] else "openai").lower().strip()
+
+        api_key = (
+            body.api_key
+            or req.headers.get("x-llm-api-key")
+            or req.headers.get("x-openai-api-key")
+        )
+        if not api_key:
+            row = conn.execute("SELECT value FROM settings WHERE key=?", (f"ai_{provider}_key",)).fetchone()
+            if row and row["value"]:
+                api_key = str(row["value"]).strip()
+        if not api_key and provider == "openai":
+            row = conn.execute("SELECT value FROM settings WHERE key='ai_default_key'").fetchone()
+            if row and row["value"]:
+                api_key = str(row["value"]).strip()
+        if not api_key:
+            api_key = (
+                os.environ.get(f"AI_BRIDGE_{provider.upper()}_API_KEY")
+                or os.environ.get(f"{provider.upper()}_API_KEY")
+                or (os.environ.get("AI_BRIDGE_CUSTOM_API_KEY") if provider == "custom" else None)
+                or os.environ.get("AI_BRIDGE_OPENAI_API_KEY")
+                or os.environ.get("OPENAI_API_KEY")
+            )
+
+        model = body.model
+        if not model:
+            if provider == "custom":
+                custom_m = conn.execute("SELECT value FROM settings WHERE key='ai_custom_model'").fetchone()
+                if custom_m and custom_m["value"]:
+                    model = str(custom_m["value"]).strip()
+            if not model:
+                def_m = conn.execute("SELECT value FROM settings WHERE key='ai_default_model'").fetchone()
+                if def_m and def_m["value"]:
+                    model = str(def_m["value"]).strip()
+
+        base_url = _normalize_custom_base_url(body.base_url) if provider == "custom" and body.base_url else body.base_url
+        if not base_url:
+            if provider == "custom":
+                custom_u = conn.execute("SELECT value FROM settings WHERE key='ai_custom_base_url'").fetchone()
+                if custom_u and custom_u["value"]:
+                    base_url = _normalize_custom_base_url(str(custom_u["value"]))
+                if not base_url:
+                    base_url = _normalize_custom_base_url(os.environ.get("AI_BRIDGE_CUSTOM_BASE_URL", ""))
+            else:
+                base_url = (
+                    "https://api.groq.com/openai/v1" if provider == "groq"
+                    else "https://api.deepseek.com/v1" if provider == "deepseek"
+                    else "https://generativelanguage.googleapis.com/v1beta/openai" if provider == "gemini"
+                    else "https://api.anthropic.com/v1" if provider == "anthropic"
+                    else "http://localhost:11434/v1" if provider == "ollama"
+                    else "https://api.openai.com/v1"
+                )
+
+        # Fetch devices in tenant for context
+        devices = conn.execute("SELECT id, name, hostname, os, status FROM devices WHERE tenant=? AND revoked=0", (body.tenant,)).fetchall()
+        dev_list_str = "\n".join([f"- {d['name']} (ID: {d['id']}, OS: {d['os']}, Status: {d['status']})" for d in devices])
+
+        system_prompt = (
+            f"You are the AI Bridge fleet controller agent.\n"
+            f"You have direct control over the user's computer fleet:\n"
+            f"{dev_list_str if dev_list_str else '- local (the AI Bridge host)'}\n\n"
+            f"Guidelines:\n"
+            f"1. To run terminal commands on Linux servers or workstations, use 'run_shell' with the appropriate device.\n"
+            f"2. To control Windows workstations with GUI automation, first call 'take_screenshot' (or 'set_of_marks_screenshot'), inspect the returned image, then use 'mouse_click', 'keyboard_type', etc.\n"
+            f"3. Screenshot coordinates are native screen pixels. Click what you see in the latest image; never guess.\n"
+            f"4. When you need to inspect, edit, or create files, use the file tools.\n"
+            f"5. Provide clear, concise summaries of your actions and results."
+        )
+
+        # If custom provider is requested without base_url
+        if provider == "custom" and not base_url:
+            return JSONResponse(status_code=400, content={"ok": False, "error": "Custom AI Provider requires a Base URL configured in Settings or passed in 'base_url'."})
+
+        # If no external LLM key is configured, perform smart intent execution
+        if not api_key and provider not in ("ollama", "custom"):
+            # Smart intent handling for common operations
+            prompt_low = body.prompt.lower().strip()
+
+            # Screenshot intent
+            if "screenshot" in prompt_low:
+                win_dev = find_default_windows_device(conn, body.tenant)
+                target = win_dev["name"] if win_dev else "local"
+                exec_in = AIExecuteIn(tool="take_screenshot", device=target, tenant=body.tenant)
+                res = await execute_ai_tool(exec_in, req, x_admin_token=x_admin_token, x_session_token=x_session_token)
+                image = _extract_image(res) if isinstance(res, dict) else None
+                return {
+                    "ok": True,
+                    "provider": "smart-intent",
+                    "response": f"Captured screenshot from {target}.",
+                    "steps": [{"tool": "take_screenshot", "device": target, "result": res}],
+                    "screenshot": image[0] if image else None,
+                    "screenshot_mime": image[1] if image else None,
+                }
+
+            # Device list intent
+            if "device" in prompt_low or "fleet" in prompt_low or "list" in prompt_low:
+                return {
+                    "ok": True,
+                    "provider": "smart-intent",
+                    "response": f"Enrolled fleet devices:\n{dev_list_str if dev_list_str else 'No remote devices enrolled yet.'}",
+                    "steps": [{"tool": "list_devices", "device": "local", "result": [dict(d) for d in devices]}],
+                }
+
+            # Shell intent: e.g. "run shell <cmd> on <device>" or "uptime on ubuntu"
+            m = re.search(r"run\s+(?:shell\s+|command\s+)?['\"]?([^'\"]+)['\"]?\s+on\s+([a-zA-Z0-9_\-]+)", body.prompt, re.IGNORECASE)
+            if m:
+                cmd = m.group(1).strip()
+                dev = m.group(2).strip()
+                exec_in = AIExecuteIn(tool="run_shell", device=dev, args={"command": cmd}, tenant=body.tenant)
+                res = await execute_ai_tool(exec_in, req, x_admin_token=x_admin_token, x_session_token=x_session_token)
+                return {
+                    "ok": True,
+                    "provider": "smart-intent",
+                    "response": f"Executed `{cmd}` on {dev}:\n```\n{json.dumps(res.get('result', ''), indent=2)}\n```",
+                    "steps": [{"tool": "run_shell", "device": dev, "args": {"command": cmd}, "result": res}],
+                }
+
+            return {
+                "ok": False,
+                "error": "No LLM API key provided. Pass your OpenAI, Claude, Gemini, or Groq API key in 'api_key' or header 'X-LLM-Key' for multi-step autonomous reasoning.",
+                "hint": "You can also use /api/ai/execute to invoke any of the 49 device tools directly with zero configuration.",
+            }
+
+        # Multi-turn autonomous tool execution loop. Anthropic uses its native
+        # Messages API; every other provider is OpenAI-compatible.
+        if not base_url:
+            base_url = "https://api.anthropic.com/v1" if provider == "anthropic" else "https://api.openai.com/v1"
+        if not model:
+            model = (
+                "gpt-4o" if provider == "openai"
+                else "claude-3-5-sonnet-20241022" if provider == "anthropic"
+                else "default"
+            )
+
+        is_anthropic = provider == "anthropic"
+        tools_spec = build_tool_specs(tool_format="openai")
+
+        # Dynamically attach tools from enabled external MCP servers
+        mcp_dispatch_map: dict[str, tuple[dict[str, Any], str]] = {}
+        try:
+            mcp_rows = conn.execute(
+                "SELECT * FROM mcp_servers WHERE tenant=? AND enabled=1",
+                (body.tenant,),
+            ).fetchall()
+            for srv_row in mcp_rows:
+                s_dict = dict(srv_row)
+                try:
+                    s_tools = json.loads(s_dict.get("tools_json") or "[]")
+                except Exception:
+                    s_tools = []
+                for t in s_tools:
+                    if not isinstance(t, dict) or not t.get("name"):
+                        continue
+                    formatted = format_mcp_tool_for_llm(t, s_dict["id"], s_dict["name"], tool_format="openai")
+                    q_name = formatted["function"]["name"]
+                    tools_spec.append(formatted)
+                    mcp_dispatch_map[q_name] = (s_dict, t["name"])
+        except Exception:
+            pass
+
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": body.prompt},
+        ]
+        steps_taken = []
+        max_steps = max(1, min(int(body.max_steps or 8), 20))
+        vision_enabled = True
+
+        for step_idx in range(max_steps):
+            req_headers = {"Content-Type": "application/json"}
+            if is_anthropic:
+                req_headers["x-api-key"] = api_key or ""
+                req_headers["anthropic-version"] = ANTHROPIC_VERSION
+            elif api_key:
+                req_headers["Authorization"] = f"Bearer {api_key}"
+            elif provider == "ollama":
+                req_headers["Authorization"] = "Bearer ollama"
+
+            def _post_llm(msgs: list[dict[str, Any]]) -> dict[str, Any]:
+                if is_anthropic:
+                    return _post_anthropic(base_url, api_key or "", model, msgs, tools_spec, body.temperature, timeout=90)
+                payload_obj = {
+                    "model": model,
+                    "messages": msgs,
+                    "tools": tools_spec,
+                    "tool_choice": "auto",
+                    "temperature": body.temperature,
+                }
+                request_obj = urllib.request.Request(
+                    f"{base_url.rstrip('/')}/chat/completions",
+                    data=json.dumps(payload_obj).encode("utf-8"),
+                    headers=req_headers,
+                    method="POST",
+                )
+                with urllib.request.urlopen(request_obj, timeout=60) as resp:
+                    return json.loads(resp.read().decode("utf-8"))
+
+            try:
+                resp_data = _post_llm(messages)
+            except urllib.error.HTTPError as err:
+                err_text = err.read().decode("utf-8") if err.fp else str(err)
+                # A text-only model rejects image parts. Retry once without them
+                # so screenshots never break the whole agent run.
+                if vision_enabled and _has_image_parts(messages):
+                    vision_enabled = False
+                    messages = _drop_images(messages)
+                    try:
+                        resp_data = _post_llm(messages)
+                    except urllib.error.HTTPError as retry_err:
+                        retry_text = retry_err.read().decode("utf-8") if retry_err.fp else str(retry_err)
+                        return JSONResponse(status_code=retry_err.code, content={"ok": False, "error": f"LLM API error ({retry_err.code}): {retry_text}"})
+                    except Exception as exc:
+                        return JSONResponse(status_code=502, content={"ok": False, "error": f"Could not reach LLM provider at {base_url}: {exc}"})
+                else:
+                    return JSONResponse(status_code=err.code, content={"ok": False, "error": f"LLM API error ({err.code}): {err_text}"})
+            except Exception as exc:
+                return JSONResponse(status_code=502, content={"ok": False, "error": f"Could not reach LLM provider at {base_url}: {exc}"})
+
+            if is_anthropic:
+                message = resp_data
+            else:
+                message = (resp_data.get("choices") or [{}])[0].get("message", {})
+            tool_calls = message.get("tool_calls") or []
+
+            # If no tool calls, model has produced the final answer
+            if not tool_calls:
+                final_content = message.get("content") or ""
+                return {
+                    "ok": True,
+                    "provider": provider,
+                    "model": model,
+                    "response": final_content,
+                    "steps": steps_taken,
+                }
+
+            # Append assistant message with tool calls
+            messages.append(message)
+
+            # Execute tool calls. Screenshots are collected separately so they
+            # can be sent as real image parts (not base64 text) after every tool
+            # message, which keeps the OpenAI message ordering valid.
+            images: list[tuple[str, str, int | None, int | None, str]] = []
+            for tc in tool_calls:
+                fn = tc.get("function", {})
+                t_name = fn.get("name")
+                try:
+                    t_args = json.loads(fn.get("arguments", "{}"))
+                except Exception:
+                    t_args = {}
+
+                if t_name in mcp_dispatch_map:
+                    srv, orig_tool = mcp_dispatch_map[t_name]
+                    if on_event:
+                        on_event({"type": "tool_start", "step": step_idx + 1, "tool": t_name, "device": f"mcp:{srv['name']}"})
+                    policy_check = enforce_mcp_tool_policy(conn, srv, orig_tool, t_args, actor=actor)
+                    if not policy_check.get("allowed", True):
+                        exec_res = {
+                            "ok": False,
+                            "status": policy_check.get("status", "denied"),
+                            "approval_id": policy_check.get("approval_id"),
+                            "error": policy_check.get("error"),
+                        }
+                    else:
+                        try:
+                            extra_h = json.loads(srv.get("headers_json") or "{}")
+                        except Exception:
+                            extra_h = {}
+                        try:
+                            srv = ensure_valid_mcp_token(conn, srv)
+                            mcp_res = execute_mcp_tool(
+                                url=srv["url"],
+                                tool_name=orig_tool,
+                                arguments=t_args,
+                                auth_header=srv.get("auth_header") or "",
+                                auth_token=srv.get("auth_token") or "",
+                                extra_headers=extra_h,
+                            )
+                            exec_res = mcp_res.get("result", mcp_res)
+                        except Exception as exc:
+                            exec_res = {"ok": False, "error": f"MCP execution error: {exc}"}
+
+                    if on_event:
+                        on_event({
+                            "type": "tool_result",
+                            "step": step_idx + 1,
+                            "tool": t_name,
+                            "device": f"mcp:{srv['name']}",
+                            "ok": not (isinstance(exec_res, dict) and exec_res.get("ok") is False),
+                        })
+
+                    steps_taken.append({
+                        "step": step_idx + 1,
+                        "tool": t_name,
+                        "device": f"mcp:{srv['name']}",
+                        "args": t_args,
+                        "result": exec_res,
+                    })
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tc.get("id"),
+                        "name": t_name,
+                        "content": json.dumps(_strip_image_fields(exec_res), default=str)[:20000],
+                    })
+                else:
+                    t_device = t_args.pop("device", None) or body.device
+                    if on_event:
+                        on_event({"type": "tool_start", "step": step_idx + 1, "tool": t_name, "device": t_device or "local"})
+                    exec_in = AIExecuteIn(tool=t_name, device=t_device, args=t_args, tenant=body.tenant)
+                    exec_res = await execute_ai_tool(exec_in, req, x_admin_token=x_admin_token, x_session_token=x_session_token)
+                    if on_event:
+                        on_event({
+                            "type": "tool_result",
+                            "step": step_idx + 1,
+                            "tool": t_name,
+                            "device": t_device or "local",
+                            "ok": not (isinstance(exec_res, dict) and exec_res.get("ok") is False),
+                        })
+
+                    steps_taken.append({
+                        "step": step_idx + 1,
+                        "tool": t_name,
+                        "device": t_device or "local",
+                        "args": t_args,
+                        "result": exec_res,
+                    })
+
+                    image = _extract_image(exec_res) if isinstance(exec_res, dict) else None
+                    if image:
+                        images.append((image[0], image[1], image[2], image[3], t_name))
+
+                    # Text-only tool response: base64 stays out of the model context.
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tc.get("id"),
+                        "name": t_name,
+                        "content": json.dumps(_strip_image_fields(exec_res), default=str)[:20000],
+                    })
+
+            if images and vision_enabled:
+                messages.append(_image_user_message(images))
+
+        return {
+            "ok": True,
+            "provider": provider,
+            "model": model,
+            "response": "Executed requested instructions across devices.",
+            "steps": steps_taken,
+        }
+
+    # 4. OpenAI-Compatible Chat Completions Endpoint
+    @app.post("/v1/chat/completions")
+    @app.post("/api/v1/chat/completions")
+    async def chat_completions(
+        body: ChatCompletionIn,
+        req: Request,
+        x_admin_token: str | None = Header(default=None),
+        x_session_token: str | None = Header(default=None),
+    ):
+        """OpenAI-compatible /v1/chat/completions endpoint for LangChain, AutoGen, CrewAI, and custom scripts."""
+        actor, role = _resolve_auth(req, x_admin_token, x_session_token)
+
+        # Extract last user message
+        last_user_msg = ""
+        for m in reversed(body.messages):
+            if m.role == "user" and m.content:
+                last_user_msg = m.content
+                break
+
+        agent_in = AIAgentIn(
+            prompt=last_user_msg or "Hello",
+            device=body.device,
+            api_key=body.api_key,
+        )
+
+        agent_result = await run_autonomous_agent(agent_in, req, x_admin_token=x_admin_token, x_session_token=x_session_token)
+        if isinstance(agent_result, Response):
+            return agent_result
+
+        response_content = agent_result.get("response") or agent_result.get("error") or "No response generated."
+        created_time = int(time.time())
+        completion_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
+
+        # Standard OpenAI response format
+        return {
+            "id": completion_id,
+            "object": "chat.completion",
+            "created": created_time,
+            "model": body.model,
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": response_content,
+                    },
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {
+                "prompt_tokens": len(last_user_msg.split()) * 2,
+                "completion_tokens": len(response_content.split()) * 2,
+                "total_tokens": (len(last_user_msg.split()) + len(response_content.split())) * 2,
+            },
+            "steps": agent_result.get("steps", []),
+        }
+
+    # 5. OpenAI-Compatible Models Endpoint
+    @app.get("/v1/models")
+    @app.get("/api/v1/models")
+    def list_models():
+        """Return available models in OpenAI format."""
+        return {
+            "object": "list",
+            "data": [
+                {"id": "ai-bridge-agent", "object": "model", "owned_by": "ai-bridge"},
+                {"id": "ai-bridge-fleet", "object": "model", "owned_by": "ai-bridge"},
+                {"id": "gpt-4o", "object": "model", "owned_by": "openai"},
+                {"id": "claude-3-5-sonnet", "object": "model", "owned_by": "anthropic"},
+            ],
+        }
+
+    # 6. Fleet AI Status & Capabilities Endpoint
+    @app.get("/api/ai/devices")
+    def get_ai_fleet(
+        req: Request,
+        tenant: str = "default",
+        x_admin_token: str | None = Header(default=None),
+        x_session_token: str | None = Header(default=None),
+    ):
+        """Get summary of online devices, OS types, and AI control capabilities."""
+        _resolve_auth(req, x_admin_token, x_session_token)
+        devices = conn.execute("SELECT id, name, hostname, os, status, last_seen, policy_json FROM devices WHERE tenant=? AND revoked=0", (tenant,)).fetchall()
+
+        out = []
+        for d in devices:
+            os_str = (d["os"] or "").lower()
+            is_win = "win" in os_str
+            is_linux = "linux" in os_str
+
+            out.append({
+                "id": d["id"],
+                "name": d["name"],
+                "hostname": d["hostname"],
+                "os": d["os"],
+                "status": d["status"],
+                "capabilities": {
+                    "desktop_gui": is_win,
+                    "screenshot": is_win,
+                    "mouse_keyboard": is_win,
+                    "shell_execution": True,
+                    "docker": is_linux,
+                    "package_management": True,
+                },
+                "last_seen": d["last_seen"],
+            })
+
+        return {"ok": True, "tenant": tenant, "count": len(out), "devices": out}
+
+    # 7. AI Provider Settings & API Keys Management
+    @app.get("/api/settings/ai")
+    def get_ai_settings(
+        req: Request,
+        x_admin_token: str | None = Header(default=None),
+        x_session_token: str | None = Header(default=None),
+    ):
+        """Return configured AI providers, models, and masked API keys."""
+        _resolve_auth(req, x_admin_token, x_session_token)
+        providers = ["openai", "anthropic", "gemini", "groq", "deepseek", "custom"]
+        configured = {}
+        masked = {}
+        for p in providers:
+            row = conn.execute("SELECT value FROM settings WHERE key=?", (f"ai_{p}_key",)).fetchone()
+            val = str(row["value"]).strip() if row and row["value"] else ""
+            if not val:
+                val = os.environ.get(f"AI_BRIDGE_{p.upper()}_API_KEY") or os.environ.get(f"{p.upper()}_API_KEY", "")
+            configured[p] = bool(val)
+            if val:
+                masked[p] = mask_key(val)
+
+        custom_url_row = conn.execute("SELECT value FROM settings WHERE key='ai_custom_base_url'").fetchone()
+        custom_base_url = str(custom_url_row["value"]).strip() if custom_url_row and custom_url_row["value"] else ""
+        if not custom_base_url:
+            custom_base_url = os.environ.get("AI_BRIDGE_CUSTOM_BASE_URL", "")
+
+        custom_model_row = conn.execute("SELECT value FROM settings WHERE key='ai_custom_model'").fetchone()
+        custom_model = str(custom_model_row["value"]).strip() if custom_model_row and custom_model_row["value"] else ""
+
+        if custom_base_url:
+            configured["custom"] = True
+
+        def_p = conn.execute("SELECT value FROM settings WHERE key='ai_default_provider'").fetchone()
+        def_m = conn.execute("SELECT value FROM settings WHERE key='ai_default_model'").fetchone()
+
+        active_provider = (def_p["value"] if def_p and def_p["value"] else "openai").strip()
+        active_model = (def_m["value"] if def_m and def_m["value"] else ("gpt-4o" if active_provider == "openai" else "claude-3-5-sonnet")).strip()
+
+        is_connected = bool(
+            configured.get(active_provider)
+            or active_provider == "ollama"
+            or (active_provider == "custom" and bool(custom_base_url))
+        )
+
+        return {
+            "ok": True,
+            "provider": active_provider,
+            "model": active_model,
+            "keys_configured": configured,
+            "masked_keys": masked,
+            "custom_base_url": custom_base_url,
+            "custom_model": custom_model,
+            "is_connected": is_connected,
+        }
+
+    @app.post("/api/settings/ai")
+    def update_ai_settings(
+        body: AISettingsIn,
+        req: Request,
+        x_admin_token: str | None = Header(default=None),
+        x_session_token: str | None = Header(default=None),
+    ):
+        """Save, test, or clear AI API keys for a provider."""
+        actor, role = _resolve_auth(req, x_admin_token, x_session_token)
+        p = body.provider.lower().strip()
+        m = (body.model or "").strip()
+        base_u = _normalize_custom_base_url(body.base_url) if p == "custom" else (body.base_url or "").strip()
+
+        def _upsert_setting(k: str, v: str) -> None:
+            conn.execute(
+                "INSERT INTO settings (key, value) VALUES (?, ?) "
+                "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+                (k, v),
+            )
+
+        if body.clear:
+            conn.execute("DELETE FROM settings WHERE key=?", (f"ai_{p}_key",))
+            if p == "custom":
+                conn.execute("DELETE FROM settings WHERE key='ai_custom_base_url'")
+                conn.execute("DELETE FROM settings WHERE key='ai_custom_model'")
+            conn.commit()
+            audit(actor, "", f"clear_ai_key_{p}", {}, "allowed")
+            return {"ok": True, "message": f"Cleared settings and API key for {p.capitalize()}."}
+
+        key = (body.api_key or "").strip()
+        if not key:
+            existing_key = conn.execute("SELECT value FROM settings WHERE key=?", (f"ai_{p}_key",)).fetchone()
+            if existing_key and existing_key["value"]:
+                key = str(existing_key["value"]).strip()
+
+        if p not in ("ollama", "custom") and not key:
+            raise HTTPException(status_code=400, detail="API key is required.")
+        if p == "custom" and not base_u:
+            existing_url = conn.execute("SELECT value FROM settings WHERE key='ai_custom_base_url'").fetchone()
+            if not existing_url or not existing_url["value"]:
+                raise HTTPException(status_code=400, detail="Base URL is required for custom AI provider (e.g. https://openrouter.ai/api/v1).")
+            base_u = _normalize_custom_base_url(str(existing_url["value"]))
+
+        if body.test_connection:
+            valid, msg = validate_llm_key(p, key, base_url=base_u, model=m)
+            if not valid:
+                raise HTTPException(status_code=400, detail=msg)
+
+        try:
+            if key:
+                _upsert_setting(f"ai_{p}_key", key)
+            if p == "custom" and base_u:
+                _upsert_setting("ai_custom_base_url", base_u)
+                if m:
+                    _upsert_setting("ai_custom_model", m)
+
+            _upsert_setting("ai_default_provider", p)
+            if m:
+                _upsert_setting("ai_default_model", m)
+            conn.commit()
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=f"Could not persist AI provider settings: {exc}") from exc
+
+        audit(actor, "", f"set_ai_key_{p}", {"model": m, "base_url": base_u}, "allowed")
+        return {
+            "ok": True,
+            "message": f"Successfully connected to {p.capitalize()}!",
+            "provider": p,
+            "model": m or ("gpt-4o" if p == "openai" else "claude-3-5-sonnet" if p == "anthropic" else "gemini-1.5-pro"),
+            "base_url": base_u if p == "custom" else None,
+            "masked_key": mask_key(key) if key else "",
+        }
+
+    # 8. Conversational Dashboard AI Copilot
+    @app.post("/api/ai/chat")
+    async def ai_chat(
+        body: AIChatIn,
+        req: Request,
+        x_admin_token: str | None = Header(default=None),
+        x_session_token: str | None = Header(default=None),
+    ):
+        """Conversational AI Copilot for the Dashboard with fleet awareness,
+        tool calling, and live screenshot attachments."""
+        actor, role = _resolve_auth(req, x_admin_token, x_session_token)
+
+        last_prompt = ""
+        for m in reversed(body.messages):
+            if m.role == "user" and m.content:
+                last_prompt = m.content
+                break
+        if not last_prompt:
+            return {"ok": True, "message": {"role": "assistant", "content": "How can I help you manage your computer fleet?"}}
+
+        chat_prov = (body.provider or "").lower().strip()
+        if not chat_prov or chat_prov == "auto":
+            def_p = conn.execute("SELECT value FROM settings WHERE key='ai_default_provider'").fetchone()
+            chat_prov = (def_p["value"] if def_p and def_p["value"] else "openai").lower().strip()
+
+        chat_mod = (body.model or "").strip()
+        if not chat_mod:
+            if chat_prov == "custom":
+                custom_m = conn.execute("SELECT value FROM settings WHERE key='ai_custom_model'").fetchone()
+                if custom_m and custom_m["value"]:
+                    chat_mod = str(custom_m["value"]).strip()
+            if not chat_mod:
+                def_m = conn.execute("SELECT value FROM settings WHERE key='ai_default_model'").fetchone()
+                if def_m and def_m["value"]:
+                    chat_mod = str(def_m["value"]).strip()
+
+        agent_in = AIAgentIn(
+            prompt=last_prompt,
+            device=body.device,
+            provider=chat_prov,
+            model=chat_mod or None,
+            api_key=body.api_key,
+            base_url=body.base_url,
+            tenant=body.tenant,
+        )
+
+        agent_res = await run_autonomous_agent(agent_in, req, x_admin_token=x_admin_token, x_session_token=x_session_token)
+        if isinstance(agent_res, Response):
+            return agent_res
+
+        # Check if any step captured a screenshot (local or remote device result).
+        screenshot_b64 = agent_res.get("screenshot")
+        screenshot_mime = agent_res.get("screenshot_mime") or "image/jpeg"
+        steps = agent_res.get("steps", [])
+        if not screenshot_b64:
+            for st in steps:
+                image = _extract_image(st.get("result"))
+                if image:
+                    screenshot_b64, screenshot_mime = image[0], image[1]
+                    break
+
+        resp_text = agent_res.get("response") or agent_res.get("error") or "Operation complete."
+
+        return {
+            "ok": True,
+            "message": {
+                "role": "assistant",
+                "content": resp_text,
+                "screenshot": screenshot_b64,
+            },
+            "steps": steps,
+            "screenshot": screenshot_b64,
+            "screenshot_mime": screenshot_mime,
+            "provider": agent_res.get("provider"),
+            "model": agent_res.get("model"),
+        }
+
+    @app.post("/api/ai/chat/stream")
+    async def ai_chat_stream(
+        body: AIChatIn,
+        req: Request,
+        x_admin_token: str | None = Header(default=None),
+        x_session_token: str | None = Header(default=None),
+    ):
+        """SSE streaming variant of /api/ai/chat emitting live tool progress and final response."""
+        _resolve_auth(req, x_admin_token, x_session_token)
+
+        history_lines = []
+        last_user = ""
+        for m in body.messages:
+            role_label = m.role if hasattr(m, "role") else m.get("role", "user")
+            content = m.content if hasattr(m, "content") else m.get("content", "")
+            if isinstance(content, list):
+                content = " ".join(p.get("text", "") for p in content if isinstance(p, dict) and p.get("type") == "text")
+            if role_label == "user":
+                last_user = str(content)
+            history_lines.append(f"{role_label.upper()}: {content}")
+
+        combined_prompt = "\n".join(history_lines[-10:]) if len(history_lines) > 1 else (last_user or "Hello")
+        agent_in = AIAgentIn(
+            prompt=combined_prompt,
+            provider=body.provider,
+            model=body.model,
+            api_key=body.api_key,
+            base_url=body.base_url,
+            device=body.device,
+            tenant=body.tenant,
+        )
+
+        queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
+
+        def _emit(ev: dict[str, Any]) -> None:
+            queue.put_nowait(ev)
+
+        async def _worker() -> None:
+            try:
+                agent_res = await run_autonomous_agent(
+                    agent_in, req, x_admin_token=x_admin_token, x_session_token=x_session_token, on_event=_emit
+                )
+                if isinstance(agent_res, Response):
+                    try:
+                        err_payload = json.loads(agent_res.body.decode("utf-8"))
+                    except Exception:
+                        err_payload = {"detail": "Agent error"}
+                    queue.put_nowait({"type": "error", "error": err_payload.get("detail") or err_payload.get("error") or "Agent error"})
+                    return
+
+                screenshot_b64 = agent_res.get("screenshot")
+                screenshot_mime = agent_res.get("screenshot_mime") or "image/jpeg"
+                steps = agent_res.get("steps", [])
+                if not screenshot_b64:
+                    for st in steps:
+                        image = _extract_image(st.get("result"))
+                        if image:
+                            screenshot_b64, screenshot_mime = image[0], image[1]
+                            break
+                resp_text = agent_res.get("response") or agent_res.get("error") or "Operation complete."
+                queue.put_nowait({
+                    "type": "done",
+                    "ok": True,
+                    "message": {"role": "assistant", "content": resp_text, "screenshot": screenshot_b64},
+                    "steps": steps,
+                    "screenshot": screenshot_b64,
+                    "screenshot_mime": screenshot_mime,
+                    "provider": agent_res.get("provider"),
+                    "model": agent_res.get("model"),
+                })
+            except Exception as exc:
+                queue.put_nowait({"type": "error", "error": str(exc)})
+            finally:
+                queue.put_nowait(None)
+
+        async def _event_gen():
+            task = asyncio.create_task(_worker())
+            try:
+                while True:
+                    ev = await queue.get()
+                    if ev is None:
+                        break
+                    yield f"data: {json.dumps(ev, default=str)}\n\n"
+            finally:
+                if not task.done():
+                    task.cancel()
+
+        return StreamingResponse(_event_gen(), media_type="text/event-stream")

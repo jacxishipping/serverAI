@@ -1,0 +1,309 @@
+"""Agent poller: outbound-only loop with long-polling, auto token rotation,
+and bounded exponential backoff.
+
+The agent never listens on a port. It heartbeats, asks for the next
+queued task, executes it through ai_bridge.control.dispatch
+(policy-enforced), and posts the result. On transient errors it backs
+off 2s -> 4s -> ... capped at 60s, resetting on the next success.
+"""
+from __future__ import annotations
+
+import json
+import os
+import platform
+import sys
+import time
+import urllib.error
+import urllib.request
+from collections.abc import Callable
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
+from ai_bridge.control.dispatch import dispatch
+from ai_bridge.policy import Policy
+from ai_bridge.tools import default_policy
+
+from .spool import TaskSpooler
+
+MAX_RESULT_CHARS = 512_000
+ROTATE_THRESHOLD_SECONDS = 2 * 86400  # Rotate when < 48h remaining
+
+
+def _collect_metrics() -> dict:
+    metrics: dict = {}
+    try:
+        import socket
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            s.connect(("8.8.8.8", 80))
+            metrics["ip_address"] = s.getsockname()[0]
+        finally:
+            s.close()
+    except Exception:
+        pass
+
+    try:
+        import psutil
+        vm = psutil.virtual_memory()
+        cpu = psutil.cpu_percent(interval=None)
+        root = os.path.splitdrive(os.getcwd())[0] or "/"
+        if not root.endswith(os.sep):
+            root += os.sep
+        disk = psutil.disk_usage(root)
+        metrics["cpu_percent"] = round(float(cpu), 1)
+        metrics["memory_percent"] = round(float(vm.percent), 1)
+        metrics["memory_total_gb"] = round(float(vm.total) / (1024 ** 3), 1)
+        metrics["disk_percent"] = round(float(disk.percent), 1)
+        metrics["disk_total_gb"] = round(float(disk.total) / (1024 ** 3), 1)
+        boot_ts = psutil.boot_time()
+        if boot_ts:
+            metrics["uptime_hours"] = round(max(0.0, time.time() - float(boot_ts)) / 3600.0, 1)
+    except Exception:
+        try:
+            import shutil
+            root = os.path.splitdrive(os.getcwd())[0] or "/"
+            if not root.endswith(os.sep):
+                root += os.sep
+            tot, used, free = shutil.disk_usage(root)
+            if tot > 0:
+                metrics["disk_percent"] = round((used / tot) * 100.0, 1)
+                metrics["disk_total_gb"] = round(float(tot) / (1024 ** 3), 1)
+        except Exception:
+            pass
+        if os.path.exists("/proc/uptime"):
+            try:
+                with open("/proc/uptime", encoding="utf-8") as f:
+                    up_sec = float(f.read().split()[0])
+                    metrics["uptime_hours"] = round(up_sec / 3600.0, 1)
+            except Exception:
+                pass
+    return metrics
+
+
+class Poller:
+    def __init__(
+        self,
+        control_url: str,
+        device_token: str,
+        *,
+        policy: Policy | None = None,
+        token_file: Path | None = None,
+        token_saver: Callable[[str], None] | None = None,
+        token_loader: Callable[[], str | None] | None = None,
+    ):
+        self.control_url = control_url.rstrip("/")
+        self.device_token = device_token
+        # WebRTC streaming tasks need these to signal back to the plane.
+        try:
+            from ai_bridge import webrtc_stream
+
+            webrtc_stream.set_agent_context(self.control_url, self.device_token)
+        except Exception:
+            pass
+        self._explicit_policy = policy
+        self.policy = policy if policy is not None else default_policy()
+        self.token_file = token_file or (Path.home() / ".ai-bridge" / "device.token")
+        # Optional persistence hooks: the Windows desktop app uses these to keep
+        # rotated tokens DPAPI-sealed instead of writing plaintext.
+        self._token_saver = token_saver
+        self._token_loader = token_loader
+        spool_path = self.token_file.parent / "agent_spool.db" if self.token_file else None
+        self.spooler = TaskSpooler(spool_path)
+        self.backoff = 2.0
+
+    def _req(self, method: str, path: str, payload: dict | None = None, timeout: int = 15) -> dict:
+        data = json.dumps(payload).encode() if payload is not None else None
+        req = urllib.request.Request(
+            self.control_url + path,
+            data=data,
+            method=method,
+            headers={
+                "X-Device-Token": self.device_token,
+                "Content-Type": "application/json",
+            },
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return json.loads(resp.read() or b"{}")
+        except urllib.error.HTTPError as exc:
+            raise RuntimeError(f"Control plane returned HTTP {exc.code}")
+
+    def _save_token(self, token: str) -> None:
+        if self._token_saver is not None:
+            try:
+                self._token_saver(token)
+                return
+            except Exception:
+                pass
+        try:
+            self.token_file.parent.mkdir(parents=True, exist_ok=True)
+            tmp_file = self.token_file.with_name(f"{self.token_file.name}.tmp")
+            tmp_file.write_text(token, encoding="utf-8")
+            try:
+                os.chmod(tmp_file, 0o600)
+            except OSError:
+                pass
+            tmp_file.replace(self.token_file)
+            try:
+                os.chmod(self.token_file, 0o600)
+            except OSError:
+                pass
+        except OSError:
+            pass
+
+    def _load_saved_token(self) -> str | None:
+        if self._token_loader is not None:
+            try:
+                return self._token_loader()
+            except Exception:
+                return None
+        try:
+            if self.token_file.exists():
+                tok = self.token_file.read_text(encoding="utf-8").strip()
+                return tok or None
+        except OSError:
+            pass
+        return None
+
+    def rotate_token(self) -> str:
+        res = self._req("POST", "/api/agent/rotate", {})
+        new_tok = res.get("device_token")
+        if new_tok:
+            self.device_token = new_tok
+            self._save_token(new_tok)
+        return self.device_token
+
+    def heartbeat(self) -> dict:
+        hb_body = {
+            "hostname": platform.node(),
+            "os": f"{platform.system()} {platform.release()}".strip(),
+            "metrics": _collect_metrics(),
+        }
+        try:
+            hb = self._req("POST", "/api/agent/heartbeat", hb_body)
+        except RuntimeError as exc:
+            if "HTTP 401" in str(exc):
+                saved = self._load_saved_token()
+                if saved and saved != self.device_token:
+                    self.device_token = saved
+                    hb = self._req("POST", "/api/agent/heartbeat", hb_body)
+                else:
+                    raise
+            else:
+                raise
+        expires = hb.get("token_expires_at")
+        if isinstance(expires, (int, float)) and expires - time.time() < ROTATE_THRESHOLD_SECONDS:
+            try:
+                self.rotate_token()
+            except Exception:
+                pass
+        return hb
+
+    def _effective_policy(self, remote_policy: dict | None) -> Policy:
+        base = self._explicit_policy if self._explicit_policy is not None else default_policy()
+        if not isinstance(remote_policy, dict):
+            return base
+
+        unrestricted = bool(remote_policy.get("unrestricted", getattr(base, "unrestricted", False))) or getattr(base, "unrestricted", False)
+        remote_denied = frozenset(remote_policy.get("denied_tools") or [])
+        remote_allowed = frozenset(remote_policy.get("allowed_tools") or []) if "allowed_tools" in remote_policy and remote_policy["allowed_tools"] is not None else None
+
+        if unrestricted:
+            return Policy(
+                allow_writes=True,
+                allow_tier3=True,
+                desktop_enabled=True,
+                max_tier_unattended=4,
+                unrestricted=True,
+                allowed_apps=base.allowed_apps or frozenset({"*"}),
+                allowed_services=base.allowed_services or frozenset({"*"}),
+                allowed_test_commands=frozenset({"*"}),
+                allowed_tools=remote_allowed,
+                denied_tools=base.denied_tools | remote_denied,
+            )
+
+        remote_apps = remote_policy.get("allowed_apps")
+        if remote_apps is not None:
+            if self._explicit_policy and self._explicit_policy.allowed_apps:
+                allowed_apps = frozenset(remote_apps) | self._explicit_policy.allowed_apps
+            else:
+                allowed_apps = frozenset(remote_apps) | base.allowed_apps
+        else:
+            allowed_apps = base.allowed_apps
+
+        allow_writes = bool(remote_policy.get("allow_writes", base.allow_writes)) or base.allow_writes
+        allow_tier3 = bool(remote_policy.get("allow_tier3", base.allow_tier3)) or base.allow_tier3
+        desktop_enabled = bool(remote_policy.get("desktop_enabled", base.desktop_enabled)) or base.desktop_enabled
+        max_tier_unattended = max(int(remote_policy.get("max_tier_unattended", base.max_tier_unattended)), base.max_tier_unattended)
+        return Policy(
+            allow_writes=allow_writes,
+            allow_tier3=allow_tier3,
+            desktop_enabled=desktop_enabled,
+            allowed_apps=allowed_apps,
+            allowed_services=base.allowed_services | frozenset(remote_policy.get("allowed_services") or []),
+            allowed_test_commands=base.allowed_test_commands,
+            max_tier_unattended=max_tier_unattended,
+            allowed_tools=remote_allowed,
+            denied_tools=base.denied_tools | remote_denied,
+            unrestricted=False,
+        )
+
+    def _try_post_result(self, task_id: str, status: str, result: str) -> bool:
+        try:
+            self._req("POST", f"/api/agent/tasks/{task_id}/result", {"status": status, "result": result})
+            return True
+        except Exception:
+            return False
+
+    def run_once(self, wait: int = 0) -> dict:
+        try:
+            self.spooler.flush(self._try_post_result)
+        except Exception:
+            pass
+        self.heartbeat()
+        path = f"/api/agent/tasks/next?wait={wait}" if wait > 0 else "/api/agent/tasks/next"
+        nxt = self._req("GET", path, timeout=max(15, wait + 5))
+        task = nxt.get("task")
+        if not task:
+            self.backoff = 2.0
+            return {"task": None, "emergency_stop": nxt.get("emergency_stop", False)}
+        task_id = task["id"]
+        try:
+            args = json.loads(task.get("args_json") or "{}")
+            eff_policy = self._effective_policy(task.get("policy"))
+            result = dispatch(
+                task["tool"],
+                args,
+                policy=eff_policy,
+                approval_granted=bool(task.get("approval_granted")),
+            )
+            status, text = "completed", json.dumps(result, default=str)[:MAX_RESULT_CHARS]
+        except PermissionError as exc:
+            status, text = "failed", f"denied: {exc}"
+        except Exception as exc:
+            status, text = "failed", f"{type(exc).__name__}: {exc}"
+        # Persist locally in spool before transmission
+        self.spooler.spool(task_id, status, text)
+        if self._try_post_result(task_id, status, text):
+            self.spooler.mark_flushed(task_id)
+        else:
+            print(f"[{time.strftime('%H:%M:%S')}] Task {task_id} result spooled offline (will flush upon reconnect).", flush=True)
+        print(f"[{time.strftime('%H:%M:%S')}] Task {task_id} ({task['tool']}) -> {status}", flush=True)
+        self.backoff = 2.0
+        return {"task": task_id, "status": status}
+
+    def run_forever(self) -> None:
+        print(f"[{time.strftime('%H:%M:%S')}] AI Bridge Agent polling {self.control_url} ...", flush=True)
+        had_error = False
+        while True:
+            try:
+                out = self.run_once(wait=15)
+                if had_error:
+                    print(f"[{time.strftime('%H:%M:%S')}] Agent reconnected to control plane (OK).", flush=True)
+                    had_error = False
+                time.sleep(0.1 if out.get("task") else 0.5)
+            except Exception as exc:
+                had_error = True
+                print(f"[{time.strftime('%H:%M:%S')}] Agent error (retry in {self.backoff:.0f}s): {exc}", flush=True)
+                time.sleep(self.backoff)
+                self.backoff = min(self.backoff * 2, 60.0)

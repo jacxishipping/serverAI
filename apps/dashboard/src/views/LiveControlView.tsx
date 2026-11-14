@@ -1,0 +1,142 @@
+import React, { useCallback, useEffect, useState } from "react";
+import { ArrowUpRight, RefreshCw, ShieldCheck } from "lucide-react";
+import { api, ApiError, clearCredentials, token, sessionToken } from "../api";
+import { GlassModal, JXAlert, JXBadge, JXButton } from "../ui";
+import { Brand } from "../Brand";
+import { DensityControl } from "../DensityControl";
+import { LanguageControl } from "../LanguageControl";
+import { useLanguage } from "../i18n";
+import { useDashboardStore } from "../state/dashboardStore";
+import { LiveWorkspace } from "./live/LiveWorkspace";
+import type { LiveDevice } from "./live/shared";
+
+interface Snapshot { identity: { actor?: string; username?: string; role?: string }; health: { version: string; emergency_stop: boolean }; devices: LiveDevice[]; checkedAt: Date }
+
+/** Live data is deliberately separate from the local demonstration store. */
+export function LiveControlView() {
+  const { t, date } = useLanguage();
+  const navigate = useDashboardStore((s) => s.setCurrentView);
+  const [snapshot, setSnapshot] = useState<Snapshot | null>(null);
+  const [error, setError] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [confirm, setConfirm] = useState(false);
+  const [acting, setActing] = useState(false);
+  const [actionError, setActionError] = useState("");
+  // A 401 clears the stored credential, which would otherwise make the view look
+  // like guest demo mode and quietly show sample data after a session ends.
+  const [expired, setExpired] = useState(false);
+  const isLive = typeof window !== "undefined" && Boolean(token() || sessionToken());
+  const refresh = useCallback(async () => {
+    setLoading(true);
+    setError("");
+    const wasAuthenticated = Boolean(token() || sessionToken());
+    try {
+      const [identity, health, devices] = await Promise.all([api.me(), api.health(), api.devices()]);
+      setSnapshot({ identity, health, devices: Array.isArray(devices) ? devices : devices.devices || [], checkedAt: new Date() });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "Unable to load the control plane.";
+      if (wasAuthenticated && err instanceof ApiError && err.status === 401) setExpired(true);
+      // Suppress expected demo-mode errors from console to reduce noise
+      if (!isLive && typeof console !== "undefined") {
+        // eslint-disable-next-line no-console
+        console.info("[Demo mode] Control plane fetch skipped — no credentials.");
+      }
+      setError(message);
+    }
+    finally { setLoading(false); }
+  }, [isLive]);
+  useEffect(() => { void refresh(); }, [refresh]);
+  const signOut = async () => {
+    try { await api.logout(); } catch { /* Local credentials must still be cleared if the API is offline. */ }
+    clearCredentials();
+    navigate("login");
+  };
+  const changeStop = async () => {
+    if (!snapshot) return;
+    setActing(true);
+    setActionError("");
+    try {
+      if (snapshot.health.emergency_stop) await api.emergencyClear(); else await api.emergencyStop();
+      setConfirm(false);
+      await refresh();
+    } catch (err) { setActionError(err instanceof Error ? err.message : "The server rejected this action."); }
+    finally { setActing(false); }
+  };
+  if (expired) {
+    return <main className="product-live">
+      <header className="product-topbar">
+        <div className="product-container flex min-h-14 flex-wrap items-center justify-between gap-3 py-2"><Brand /></div>
+      </header>
+      <div className="product-container space-y-4 py-6" lang="en" dir="ltr">
+        <JXAlert severity="error" title="Session expired" description="Your session expired. No sample data is shown while the session is invalid." />
+        <JXButton color="primary" onClick={() => { clearCredentials(); navigate("login"); }}>Return to sign in</JXButton>
+      </div>
+    </main>;
+  }
+  return <main className="product-live">
+    <header className="product-topbar">
+      <div className="product-container flex min-h-14 flex-wrap items-center justify-between gap-3 py-2">
+        <Brand />
+        <div className="flex flex-wrap items-center gap-2">
+          <LanguageControl />
+          <DensityControl />
+          <JXButton color="neutral" variant="outlined" onClick={refresh} disabled={loading} loading={loading} loadingLabel={t("Refreshing…")} startIcon={<RefreshCw className="h-4 w-4" />}>{t("Refresh")}</JXButton>
+          <JXButton color="neutral" variant="text" onClick={signOut}>{t("Sign out")}</JXButton>
+        </div>
+      </div>
+    </header>
+    <div className="product-container space-y-4 py-4 sm:py-5">
+      <div className="flex flex-wrap items-center justify-between gap-4">
+        <div className="space-y-1">
+          <h1>{t("Control plane")}</h1>
+          {snapshot && <p lang="en" dir="ltr" className="text-xs text-[color:var(--product-text-tertiary)]">Updated <bdi>{date(snapshot.checkedAt, { timeStyle: "medium" })}</bdi></p>}
+        </div>
+        {snapshot && <div className="flex min-w-0 flex-wrap items-center gap-4">
+          <p lang="en" dir="ltr" className="max-w-full break-words text-xs [overflow-wrap:anywhere] text-[color:var(--product-text-secondary)]">Signed in as <bdi>{snapshot.identity.actor || snapshot.identity.username || "operator"}</bdi> · {snapshot.identity.role}</p>
+          <JXBadge color={error ? "warning" : "success"} statusText={t(error ? "Stale data" : "Connected")} />
+        </div>}
+      </div>
+      {error && <div lang="en" dir="ltr" className="space-y-3">
+        {isLive ? (
+          <JXAlert severity="error" title="Control plane unavailable" description={`${error} Previously loaded data, if shown, may be stale.`} />
+        ) : (
+          <JXAlert severity="info" title="Demo workspace" description="You are viewing sample data. Connect a control plane to see live devices and fleet status." />
+        )}
+        <JXButton color="neutral" variant="outlined" onClick={signOut}>{isLive ? "Return to sign in" : "Connect server"}</JXButton>
+      </div>}
+      {loading && !snapshot && <p role="status" lang="en" dir="ltr" className="py-8 text-sm text-[color:var(--product-text-tertiary)]">Loading your control plane…</p>}
+      {snapshot && <>
+        <section lang="en" dir="ltr" aria-label="Fleet safety" className="product-safety relative px-3 py-2" data-stopped={snapshot.health.emergency_stop}>
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <div className="flex min-w-0 items-center gap-3">
+                <ShieldCheck className="h-4 w-4 shrink-0 text-[color:var(--product-text-tertiary)]" aria-hidden="true" />
+                <p role="status" className="text-sm text-[color:var(--product-text-secondary)]">{snapshot.health.emergency_stop ? "Emergency stop is active." : "Emergency stop is not active."}</p>
+              </div>
+              <JXButton variant="outlined" color={snapshot.health.emergency_stop ? "success" : "error"}
+                disabled={Boolean(error) || snapshot.identity.role !== "admin"}
+                onClick={() => { setActionError(""); setConfirm(true); }}>{snapshot.health.emergency_stop ? "Clear emergency stop" : "Stop fleet"}</JXButton>
+            </div>
+            {snapshot.identity.role !== "admin" && <p className="mt-2 text-xs text-[color:var(--product-text-tertiary)]">An administrator is required to change the emergency stop.</p>}
+        </section>
+        <LiveWorkspace key={`${snapshot.identity.actor || snapshot.identity.username}:${snapshot.identity.role}`}
+          identity={`${snapshot.identity.actor || snapshot.identity.username || "operator"}:${snapshot.identity.role}`}
+          role={snapshot.identity.role || "viewer"} devices={snapshot.devices} stale={Boolean(error) || loading}
+          stopped={snapshot.health.emergency_stop} refresh={() => { void refresh(); }} />
+      </>}
+      <footer lang="en" dir="ltr" className="flex flex-wrap items-center justify-between gap-3 border-t border-[color:var(--product-line)] pt-5">
+        <p className="text-xs leading-relaxed text-[color:var(--product-text-tertiary)]">Operations Dashboard: view complete fleet telemetry, charts, and device execution.</p>
+        <JXButton color="neutral" variant="text" onClick={() => navigate("overview")} endIcon={<ArrowUpRight className="h-4 w-4" />}>Explore full dashboard</JXButton>
+      </footer>
+    </div>
+    <div lang="en" dir="ltr"><GlassModal open={confirm} onClose={() => { if (!acting) setConfirm(false); }} title={snapshot?.health.emergency_stop ? "Clear the real emergency stop?" : "Stop the real fleet?"}>
+      <div className="space-y-5">
+        <p className="text-sm leading-relaxed text-[color:var(--product-text-secondary)]">This sends an authenticated request to your control plane and affects real devices. Continue only if you are authorized.</p>
+        {actionError && <JXAlert severity="error" title="Change not confirmed" description={actionError} />}
+        <div className="flex flex-wrap justify-end gap-3">
+          <JXButton color="neutral" variant="outlined" disabled={acting} onClick={() => setConfirm(false)}>Cancel</JXButton>
+          <JXButton color="error" loading={acting} disabled={acting} onClick={changeStop}>Confirm change</JXButton>
+        </div>
+      </div>
+    </GlassModal></div>
+  </main>;
+}

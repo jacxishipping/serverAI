@@ -1,0 +1,39 @@
+# Control plane + dashboard dev stack. Postgres is provided for production
+# use; the app defaults to SQLite unless you wire DATABASE_URL yourself
+# (see migrations/001_initial.sql). Do not expose :8000 publicly without
+# the TLS reverse proxy in docs/remote-access.md.
+services:
+  control-api:
+    build: { context: ., dockerfile: deployment/docker/Dockerfile }
+    ports: ["127.0.0.1:8000:8000"]
+    environment:
+      - AI_BRIDGE_ADMIN_TOKEN=${AI_BRIDGE_ADMIN_TOKEN:?Set AI_BRIDGE_ADMIN_TOKEN in .env}
+      - AI_BRIDGE_WORKSPACE=/workspace
+    volumes: ["./ai-bridge-workspace:/workspace"]
+  postgres:
+    image: postgres:16
+    environment:
+      - POSTGRES_DB=ai_bridge
+      - POSTGRES_USER=ai_bridge
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+    volumes: ["ai-bridge-pg:/var/lib/postgresql/data"]
+    profiles: ["production"]
+  coturn:
+    image: coturn/coturn:4.6.2-alpine
+    container_name: aibridge-coturn-dev
+    restart: unless-stopped
+    ports:
+      - "3478:3478/tcp"
+      - "3478:3478/udp"
+    command:
+      - turnserver
+      - -n
+      - --log-file=stdout
+      - --realm=localhost
+      - --lt-cred-mech
+      - --use-auth-secret
+      - --static-auth-secret=aibridge_turn_shared_secret_2026
+      - --listening-port=3478
+    profiles: ["coturn"]
+volumes:
+  ai-bridge-pg:
