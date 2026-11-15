@@ -13,12 +13,14 @@ import os
 import platform
 import shutil
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
 from collections.abc import Callable
 from functools import lru_cache
 from pathlib import Path
+from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 from ai_bridge.control.dispatch import dispatch
@@ -34,6 +36,8 @@ INVENTORY_TOOL_NAMES = (
     "git", "python", "python3", "node", "npm", "docker", "podman", "kubectl",
     "terraform", "ansible", "powershell", "pwsh", "ssh",
 )
+_PROCESS_CACHE: dict[str, Any] = {"checked_at": 0.0, "items": []}
+_PROCESS_CACHE_LOCK = threading.Lock()
 
 
 @lru_cache(maxsize=1)
@@ -86,6 +90,12 @@ def _collect_inventory() -> dict:
     capabilities = ["task.polling", "telemetry.system_metrics", "inventory.installed_apps", "inventory.installed_tools"]
     if system in {"windows", "darwin", "linux"}:
         capabilities.extend(("desktop.capture", "desktop.input"))
+    try:
+        import psutil
+
+        process_count = len(psutil.pids())
+    except Exception:
+        process_count = None
     return {
         "schema_version": INVENTORY_SCHEMA_VERSION,
         "runtime": {
@@ -97,7 +107,36 @@ def _collect_inventory() -> dict:
         "capabilities": sorted(capabilities),
         "installed_tools": installed_tools,
         "installed_apps": _collect_installed_apps(),
+        "process_count": process_count,
+        "processes": _collect_process_inventory(),
     }
+
+
+def _collect_process_inventory() -> list[dict[str, Any]]:
+    """Return a cached, bounded process-name snapshot without command lines or paths."""
+    with _PROCESS_CACHE_LOCK:
+        now = time.monotonic()
+        if now - float(_PROCESS_CACHE["checked_at"]) < 30.0:
+            return list(_PROCESS_CACHE["items"])
+        items: list[dict[str, Any]] = []
+        try:
+            import psutil
+
+            for process in psutil.process_iter(("name", "memory_info")):
+                try:
+                    name = str(process.info.get("name") or "").strip()
+                    memory = process.info.get("memory_info")
+                    if name:
+                        items.append({"name": name[:160], "memory_mb": round(memory.rss / (1024 * 1024), 1) if memory else None})
+                except (psutil.Error, OSError):
+                    continue
+            items.sort(key=lambda item: float(item["memory_mb"] or 0), reverse=True)
+            items = items[:50]
+        except Exception:
+            items = []
+        _PROCESS_CACHE["checked_at"] = now
+        _PROCESS_CACHE["items"] = items
+        return list(items)
 
 
 def _collect_metrics() -> dict:
@@ -122,6 +161,7 @@ def _collect_metrics() -> dict:
             root += os.sep
         disk = psutil.disk_usage(root)
         metrics["cpu_percent"] = round(float(cpu), 1)
+        metrics["process_count"] = len(psutil.pids())
         metrics["memory_percent"] = round(float(vm.percent), 1)
         metrics["memory_total_gb"] = round(float(vm.total) / (1024 ** 3), 1)
         metrics["disk_percent"] = round(float(disk.percent), 1)

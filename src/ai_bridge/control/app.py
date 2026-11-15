@@ -4189,7 +4189,12 @@ def create_app(*, admin_token: str | None = None, db_path: Path | None = None, d
         if isinstance(inventory, dict):
             # Keep reports bounded and redact credential-like values before they
             # enter durable fleet inventory.
-            clean_inventory = redact_obj(inventory)
+            inventory_report = dict(inventory)
+            inventory_report["connection_health"] = {
+                "control_plane": "connected",
+                "last_heartbeat_at": now_ts,
+            }
+            clean_inventory = redact_obj(inventory_report)
             encoded_inventory = json.dumps(clean_inventory, default=str)
             if len(encoded_inventory) <= 32_000:
                 conn.execute("UPDATE devices SET inventory_json=? WHERE id=?", (encoded_inventory, row["id"]))
