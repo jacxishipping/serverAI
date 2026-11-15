@@ -45,7 +45,9 @@ that platform path has been exercised or production-ready.
   enforce it. A shared request guard scopes device-ID APIs, including desktop
   and terminal operations, and broadcast status is tenant-filtered. Workflow,
   schedule, trigger, and broadcast creation validate the selected tenant and
-  target device. Administrators retain cross-tenant access. This is an
+  target device. Dashboard user management supports assigning tenants, and
+  default tenant parameters resolve to the signed-in account's tenant.
+  Administrators retain cross-tenant access. This is an
   implementation boundary, not a completed tenant-isolation certification;
   multi-tenant API validation remains required before production claims.
 - Heartbeats persist a bounded device capability list and inventory object. The
