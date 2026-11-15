@@ -73,7 +73,7 @@ def install_workspace_routes(app, conn, require_role, audit, require_tenant_acce
                   page_size: int = Query(default=25, ge=1, le=100),
                   x_admin_token: str | None = Header(default=None), x_session_token: str | None = Header(default=None)):
         require_role("viewer", x_admin_token, x_session_token)
-        require_tenant_access(tenant, x_admin_token, x_session_token)
+        tenant = require_tenant_access(tenant, x_admin_token, x_session_token)
         clauses, params = ["d.tenant=?"], [tenant]
         if q.strip():
             clauses.append("(LOWER(d.name) LIKE ? OR LOWER(d.hostname) LIKE ? OR LOWER(d.id) LIKE ?)")
@@ -109,7 +109,7 @@ def install_workspace_routes(app, conn, require_role, audit, require_tenant_acce
                      page_size: int = Query(default=25, ge=1, le=100),
                      x_admin_token: str | None = Header(default=None), x_session_token: str | None = Header(default=None)):
         require_role("viewer", x_admin_token, x_session_token)
-        require_tenant_access(tenant, x_admin_token, x_session_token)
+        tenant = require_tenant_access(tenant, x_admin_token, x_session_token)
         clauses, params = ["tenant=?"], [tenant]
         if status != "all":
             clauses.append("status=?")
@@ -130,7 +130,7 @@ def install_workspace_routes(app, conn, require_role, audit, require_tenant_acce
     def notifications(tenant: str = "default", x_admin_token: str | None = Header(default=None),
                       x_session_token: str | None = Header(default=None)):
         require_role("viewer", x_admin_token, x_session_token)
-        require_tenant_access(tenant, x_admin_token, x_session_token)
+        tenant = require_tenant_access(tenant, x_admin_token, x_session_token)
         offline = conn.execute("SELECT COUNT(*) AS n FROM devices WHERE tenant=? AND revoked=0 AND "
                                "(status!='online' OR last_seen IS NULL OR last_seen<?)",
                                (tenant, dbmod.now() - 120)).fetchone()["n"]

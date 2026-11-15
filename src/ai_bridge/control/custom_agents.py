@@ -1034,7 +1034,7 @@ def install_custom_agent_routes(app: Any, conn: Any, require_role: Any, audit: A
         x_session_token: str | None = Header(default=None),
     ):
         require_role("viewer", x_admin_token, x_session_token)
-        require_tenant_access(tenant, x_admin_token, x_session_token)
+        tenant = require_tenant_access(tenant, x_admin_token, x_session_token)
         rows = conn.execute(
             "SELECT * FROM custom_agents WHERE tenant=? ORDER BY created_at DESC", (tenant,)
         ).fetchall()

@@ -205,7 +205,7 @@ def install_mcp_routes(app: Any, conn: Any, require_role: Any, audit: Any, requi
         x_session_token: str | None = Header(default=None),
     ):
         require_role("viewer", x_admin_token, x_session_token)
-        require_tenant_access(tenant, x_admin_token, x_session_token)
+        tenant = require_tenant_access(tenant, x_admin_token, x_session_token)
         rows = conn.execute(
             "SELECT * FROM mcp_servers WHERE tenant=? ORDER BY created_at DESC", (tenant,)
         ).fetchall()

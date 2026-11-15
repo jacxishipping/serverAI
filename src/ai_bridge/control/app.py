@@ -780,14 +780,16 @@ def create_app(*, admin_token: str | None = None, db_path: Path | None = None, d
             raise HTTPException(status_code=401, detail="Authenticated user is unavailable.")
         return str(user["tenant"] or "default")
 
-    def require_tenant_access(tenant: str, x_admin_token: str | None = None,
+    def require_tenant_access(tenant: str | None, x_admin_token: str | None = None,
                               x_session_token: str | None = None,
                               authorization: str | None = None) -> str:
         assigned = current_user_tenant(x_admin_token, x_session_token, authorization)
-        if assigned is not None and assigned != tenant:
+        if assigned is None:
+            return tenant or "default"
+        if tenant not in (None, "", "default", assigned):
             # Hide whether the requested tenant or its records exist.
             raise HTTPException(status_code=404, detail="Resource not found.")
-        return tenant
+        return assigned
 
     def device_tenant(device_id: str) -> str:
         if device_id == "local":
@@ -1118,7 +1120,7 @@ def create_app(*, admin_token: str | None = None, db_path: Path | None = None, d
     @app.get("/api/devices", summary="List devices", description="Lists all devices in the fleet with their status, metadata, and live telemetry.")
     def list_devices(x_admin_token: str | None = Header(default=None), x_session_token: str | None = Header(default=None), tenant: str = "default"):
         require_role("viewer", x_admin_token, x_session_token)
-        require_tenant_access(tenant, x_admin_token, x_session_token)
+        tenant = require_tenant_access(tenant, x_admin_token, x_session_token)
         rows = conn.execute(
             "SELECT d.id, d.name, d.hostname, d.os, d.tenant, d.status, d.last_seen, d.revoked, d.created_at, "
             "d.token_expires_at, d.policy_json, d.capabilities_json, d.inventory_json, m.group_name, m.tags_json FROM devices d "
@@ -1536,7 +1538,7 @@ def create_app(*, admin_token: str | None = None, db_path: Path | None = None, d
     @app.post("/api/tasks")
     def submit_task(body: TaskIn, request: Request, x_admin_token: str | None = Header(default=None), x_session_token: str | None = Header(default=None)):
         actor = require_role("operator", x_admin_token, x_session_token)
-        require_tenant_access(body.tenant, x_admin_token, x_session_token)
+        body.tenant = require_tenant_access(body.tenant, x_admin_token, x_session_token)
         request_key = request.headers.get("Idempotency-Key")
         if request_key is not None and (not request_key or len(request_key) > 128 or not request_key.isascii()):
             raise HTTPException(422, "Idempotency-Key must be 1–128 ASCII characters.")
@@ -1652,7 +1654,7 @@ def create_app(*, admin_token: str | None = None, db_path: Path | None = None, d
     @app.get("/api/tasks")
     def list_tasks(x_admin_token: str | None = Header(default=None), x_session_token: str | None = Header(default=None), tenant: str = "default", device_id: str | None = None):
         require_role("viewer", x_admin_token, x_session_token)
-        require_tenant_access(tenant, x_admin_token, x_session_token)
+        tenant = require_tenant_access(tenant, x_admin_token, x_session_token)
         if device_id:
             rows = conn.execute("SELECT * FROM tasks WHERE tenant=? AND device_id=? ORDER BY created_at DESC LIMIT 200", (tenant, device_id)).fetchall()
         else:
@@ -1873,7 +1875,7 @@ def create_app(*, admin_token: str | None = None, db_path: Path | None = None, d
         x_session_token: str | None = Header(default=None),
     ):
         actor = require_role("operator", x_admin_token, x_session_token)
-        require_tenant_access(body.tenant, x_admin_token, x_session_token)
+        body.tenant = require_tenant_access(body.tenant, x_admin_token, x_session_token)
         project_id = project_id.strip()
         if not project_id or len(project_id) > 200:
             raise HTTPException(status_code=422, detail="project_id must be 1–200 characters.")
@@ -1908,7 +1910,7 @@ def create_app(*, admin_token: str | None = None, db_path: Path | None = None, d
         x_session_token: str | None = Header(default=None),
     ):
         require_role("viewer", x_admin_token, x_session_token)
-        require_tenant_access(tenant, x_admin_token, x_session_token)
+        tenant = require_tenant_access(tenant, x_admin_token, x_session_token)
         limit = min(100, max(1, int(limit)))
         conn.execute(
             "DELETE FROM project_memories WHERE tenant=? AND project_id=? AND expires_at IS NOT NULL AND expires_at<=?",
@@ -2272,7 +2274,7 @@ def create_app(*, admin_token: str | None = None, db_path: Path | None = None, d
     def list_audit(x_admin_token: str | None = Header(default=None), x_session_token: str | None = Header(default=None), tenant: str = "default", tool: str | None = None):
         import hashlib
         require_role("viewer", x_admin_token, x_session_token)
-        require_tenant_access(tenant, x_admin_token, x_session_token)
+        tenant = require_tenant_access(tenant, x_admin_token, x_session_token)
         if tool:
             rows = conn.execute("SELECT * FROM audit WHERE tenant=? AND tool=? ORDER BY id ASC LIMIT 500", (tenant, tool)).fetchall()
         else:
@@ -2297,7 +2299,7 @@ def create_app(*, admin_token: str | None = None, db_path: Path | None = None, d
     def export_audit(tenant: str = "default", since: float | None = None, until: float | None = None,
                      x_admin_token: str | None = Header(default=None), x_session_token: str | None = Header(default=None)):
         require_role("admin", x_admin_token, x_session_token)
-        require_tenant_access(tenant, x_admin_token, x_session_token)
+        tenant = require_tenant_access(tenant, x_admin_token, x_session_token)
         clauses, params = ["tenant=?"], [tenant]
         if since is not None:
             clauses.append("ts>=?"); params.append(since)
@@ -2347,7 +2349,7 @@ def create_app(*, admin_token: str | None = None, db_path: Path | None = None, d
     @app.get("/api/workflows/templates")
     def get_workflow_templates(tenant: str = "default", x_admin_token: str | None = Header(default=None), x_session_token: str | None = Header(default=None)):
         require_role("viewer", x_admin_token, x_session_token)
-        require_tenant_access(tenant, x_admin_token, x_session_token)
+        tenant = require_tenant_access(tenant, x_admin_token, x_session_token)
         custom_rows = conn.execute(
             "SELECT * FROM workflow_templates WHERE tenant=? ORDER BY created_at DESC",
             (tenant,),
@@ -2368,7 +2370,7 @@ def create_app(*, admin_token: str | None = None, db_path: Path | None = None, d
     @app.post("/api/workflows/templates")
     def create_workflow_template(body: WorkflowTemplateIn, x_admin_token: str | None = Header(default=None), x_session_token: str | None = Header(default=None)):
         actor = require_role("operator", x_admin_token, x_session_token)
-        require_tenant_access(body.tenant, x_admin_token, x_session_token)
+        body.tenant = require_tenant_access(body.tenant, x_admin_token, x_session_token)
         if not body.name.strip() or not body.steps:
             raise HTTPException(status_code=400, detail="Template name and at least one step are required.")
         tpl_id = "tpl-" + uuid.uuid4().hex[:10]
@@ -2431,7 +2433,7 @@ def create_app(*, admin_token: str | None = None, db_path: Path | None = None, d
         x_session_token: str | None = Header(default=None),
     ):
         require_role("viewer", x_admin_token, x_session_token)
-        require_tenant_access(tenant, x_admin_token, x_session_token)
+        tenant = require_tenant_access(tenant, x_admin_token, x_session_token)
         if status:
             rows = conn.execute("SELECT * FROM workflows WHERE tenant=? AND status=? ORDER BY created_at DESC LIMIT 100", (tenant, status)).fetchall()
         else:
@@ -2503,7 +2505,7 @@ def create_app(*, admin_token: str | None = None, db_path: Path | None = None, d
         x_session_token: str | None = Header(default=None),
     ):
         actor = require_role("operator", x_admin_token, x_session_token)
-        require_tenant_access(body.tenant, x_admin_token, x_session_token)
+        body.tenant = require_tenant_access(body.tenant, x_admin_token, x_session_token)
         if body.device_id and device_tenant(body.device_id) != body.tenant:
             raise HTTPException(status_code=404, detail="Resource not found.")
         if emergency_stop_active():
@@ -2945,7 +2947,7 @@ def create_app(*, admin_token: str | None = None, db_path: Path | None = None, d
         x_session_token: str | None = Header(default=None),
     ):
         require_role("viewer", x_admin_token, x_session_token)
-        require_tenant_access(tenant, x_admin_token, x_session_token)
+        tenant = require_tenant_access(tenant, x_admin_token, x_session_token)
         now_ts = dbmod.now()
         dev_rows = conn.execute("SELECT id, name, os, status, last_seen FROM devices WHERE tenant=? AND revoked=0", (tenant,)).fetchall()
         online_count = 0
@@ -3008,7 +3010,7 @@ def create_app(*, admin_token: str | None = None, db_path: Path | None = None, d
         x_session_token: str | None = Header(default=None),
     ):
         actor = require_role("operator", x_admin_token, x_session_token)
-        require_tenant_access(body.tenant, x_admin_token, x_session_token)
+        body.tenant = require_tenant_access(body.tenant, x_admin_token, x_session_token)
         query = "SELECT * FROM devices WHERE revoked=0 AND tenant=?"
         params = [body.tenant]
         if body.target_os:
@@ -3120,7 +3122,7 @@ def create_app(*, admin_token: str | None = None, db_path: Path | None = None, d
         x_session_token: str | None = Header(default=None),
     ):
         require_role("viewer", x_admin_token, x_session_token)
-        require_tenant_access(tenant, x_admin_token, x_session_token)
+        tenant = require_tenant_access(tenant, x_admin_token, x_session_token)
         rows = conn.execute("SELECT * FROM triggers WHERE tenant=? ORDER BY created_at DESC", (tenant,)).fetchall()
         out = []
         for r in rows:
@@ -3139,7 +3141,7 @@ def create_app(*, admin_token: str | None = None, db_path: Path | None = None, d
         x_session_token: str | None = Header(default=None),
     ):
         actor = require_role("admin", x_admin_token, x_session_token)
-        require_tenant_access(body.tenant, x_admin_token, x_session_token)
+        body.tenant = require_tenant_access(body.tenant, x_admin_token, x_session_token)
         if body.device_id and device_tenant(body.device_id) != body.tenant:
             raise HTTPException(status_code=404, detail="Resource not found.")
         tid = uuid.uuid4().hex[:12]
@@ -3239,7 +3241,7 @@ def create_app(*, admin_token: str | None = None, db_path: Path | None = None, d
         x_session_token: str | None = Header(default=None),
     ):
         require_role("viewer", x_admin_token, x_session_token)
-        require_tenant_access(tenant, x_admin_token, x_session_token)
+        tenant = require_tenant_access(tenant, x_admin_token, x_session_token)
         rows = conn.execute("SELECT * FROM schedules WHERE tenant=? ORDER BY created_at DESC", (tenant,)).fetchall()
         out = []
         for r in rows:
@@ -3258,7 +3260,7 @@ def create_app(*, admin_token: str | None = None, db_path: Path | None = None, d
         x_session_token: str | None = Header(default=None),
     ):
         actor = require_role("admin", x_admin_token, x_session_token)
-        require_tenant_access(body.tenant, x_admin_token, x_session_token)
+        body.tenant = require_tenant_access(body.tenant, x_admin_token, x_session_token)
         if body.device_id and device_tenant(body.device_id) != body.tenant:
             raise HTTPException(status_code=404, detail="Resource not found.")
         sid = uuid.uuid4().hex[:12]
@@ -3437,7 +3439,7 @@ def create_app(*, admin_token: str | None = None, db_path: Path | None = None, d
         x_session_token: str | None = Header(default=None),
     ):
         require_role("viewer", x_admin_token, x_session_token)
-        require_tenant_access(tenant, x_admin_token, x_session_token)
+        tenant = require_tenant_access(tenant, x_admin_token, x_session_token)
         query = "SELECT id, name, hostname, os, status, last_seen FROM devices WHERE revoked=0 AND tenant=?"
         params = [tenant]
         if os:
