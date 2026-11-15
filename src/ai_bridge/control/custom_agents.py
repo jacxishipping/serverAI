@@ -1195,6 +1195,10 @@ def install_custom_agent_routes(app: Any, conn: Any, require_role: Any, audit: A
         x_session_token: str | None = Header(default=None),
     ):
         require_role("viewer", x_admin_token, x_session_token)
+        agent = conn.execute("SELECT tenant FROM custom_agents WHERE id=?", (agent_id,)).fetchone()
+        if agent is None:
+            raise HTTPException(status_code=404, detail="Agent not found.")
+        require_tenant_access(str(agent["tenant"] or "default"), x_admin_token, x_session_token)
         limit = min(100, max(1, int(limit)))
         rows = conn.execute(
             "SELECT * FROM agent_runs WHERE agent_id=? ORDER BY started_at DESC LIMIT ?",
@@ -1221,6 +1225,7 @@ def install_custom_agent_routes(app: Any, conn: Any, require_role: Any, audit: A
         row = conn.execute("SELECT * FROM custom_agents WHERE id=?", (agent_id,)).fetchone()
         if row is None:
             raise HTTPException(status_code=404, detail="Agent not found.")
+        require_tenant_access(str(row["tenant"] or "default"), x_admin_token, x_session_token)
         agent_dict = dict(row)
         started = _now()
         run_id = uuid.uuid4().hex[:12]

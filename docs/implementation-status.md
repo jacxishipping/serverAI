@@ -40,12 +40,14 @@ that platform path has been exercised or production-ready.
   lifecycle contract in `task-lifecycle.md`. Project memory APIs record source,
   optional same-tenant task evidence and expiry; custom agents with a matching
   project ID load bounded, unexpired entries into their system context.
-- User accounts have a tenant assignment. Viewer/operator access is scoped on
-  tenant-selected task, workflow, fleet, device policy, project-memory,
-  approval, schedule, trigger, and audit routes; administrators retain
-  cross-tenant access. This is an implementation boundary, not a completed
-  tenant-isolation certification. Continue reviewing every ID-based route and
-  validate with multi-tenant API checks before production claims.
+- User accounts have a tenant assignment. Tenant-selected task, workflow,
+  fleet, project-memory, schedule, trigger, audit, and MCP/agent listing routes
+  enforce it. A shared request guard scopes device-ID APIs, including desktop
+  and terminal operations, and broadcast status is tenant-filtered. Workflow,
+  schedule, trigger, and broadcast creation validate the selected tenant and
+  target device. Administrators retain cross-tenant access. This is an
+  implementation boundary, not a completed tenant-isolation certification;
+  multi-tenant API validation remains required before production claims.
 - Heartbeats persist a bounded device capability list and inventory object. The
   shared Python poller now sends schema version 1, runtime identity, advertised
   desktop/task/telemetry capabilities, allowlisted installed tool names, and up

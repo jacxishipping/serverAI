@@ -789,6 +789,43 @@ def create_app(*, admin_token: str | None = None, db_path: Path | None = None, d
             raise HTTPException(status_code=404, detail="Resource not found.")
         return tenant
 
+    def device_tenant(device_id: str) -> str:
+        if device_id == "local":
+            return "default"
+        row = conn.execute("SELECT tenant FROM devices WHERE id=?", (device_id,)).fetchone()
+        if row is None:
+            raise HTTPException(status_code=404, detail="Device not found.")
+        return str(row["tenant"] or "default")
+
+    @app.middleware("http")
+    async def enforce_device_tenant(request: Request, call_next):
+        """Apply tenant ownership to every user-facing device-ID route."""
+        parts = request.url.path.split("/")
+        if len(parts) >= 4 and parts[1:3] == ["api", "devices"]:
+            device_id = parts[3]
+            headers = request.headers
+            admin_token = headers.get("x-admin-token") or request.query_params.get("token")
+            session_token = headers.get("x-session-token") or request.query_params.get("session_token")
+            authorization = headers.get("authorization")
+            try:
+                assigned_tenant = current_user_tenant(admin_token, session_token, authorization)
+                if assigned_tenant is not None:
+                    if device_id == "local":
+                        device_tenant = "default"
+                    else:
+                        row = conn.execute("SELECT tenant FROM devices WHERE id=?", (device_id,)).fetchone()
+                        if row is None:
+                            return JSONResponse({"detail": "Resource not found."}, status_code=404)
+                        device_tenant = str(row["tenant"] or "default")
+                    if assigned_tenant != device_tenant:
+                        return JSONResponse({"detail": "Resource not found."}, status_code=404)
+            except HTTPException as exc:
+                # Let unauthenticated requests reach the route's normal auth
+                # handling; a supplied but invalid credential fails closed.
+                if admin_token or session_token or authorization:
+                    return JSONResponse({"detail": exc.detail}, status_code=exc.status_code)
+        return await call_next(request)
+
     def require_admin(x_admin_token: str | None = None, x_session_token: str | None = None,
                       authorization: str | None = None, admin_token: str | None = None):
         return require_role("admin", x_admin_token, x_session_token, authorization, admin_token=admin_token)
@@ -2369,6 +2406,8 @@ def create_app(*, admin_token: str | None = None, db_path: Path | None = None, d
         now_ts = dbmod.now()
         sched_name = (body.name or f"Workflow: {row['name']}").strip()
         dev_id = body.device_id if body.device_id is not None else (row["device_id"] or "")
+        if dev_id and dev_id != "local" and device_tenant(dev_id) != str(row["tenant"]):
+            raise HTTPException(status_code=404, detail="Resource not found.")
         wf_payload = {
             "source_workflow_id": workflow_id,
             "name": row["name"],
@@ -2464,6 +2503,9 @@ def create_app(*, admin_token: str | None = None, db_path: Path | None = None, d
         x_session_token: str | None = Header(default=None),
     ):
         actor = require_role("operator", x_admin_token, x_session_token)
+        require_tenant_access(body.tenant, x_admin_token, x_session_token)
+        if body.device_id and device_tenant(body.device_id) != body.tenant:
+            raise HTTPException(status_code=404, detail="Resource not found.")
         if emergency_stop_active():
             raise HTTPException(status_code=403, detail="Emergency stop is active; workflows rejected.")
         row = conn.execute("SELECT * FROM workflows WHERE id=?", (workflow_id,)).fetchone()
@@ -2499,29 +2541,32 @@ def create_app(*, admin_token: str | None = None, db_path: Path | None = None, d
     def _execute_workflow_step_sync(action: str, args: dict, target_device_id: str | None, tenant: str, actor: str) -> dict:
         if target_device_id and target_device_id != "local":
             dev_row = conn.execute("SELECT * FROM devices WHERE id=? AND revoked=0", (target_device_id,)).fetchone()
-            if dev_row:
-                tier = TOOL_TIERS.get(action)
-                t_val = tier.value if tier else 2
-                task_id = uuid.uuid4().hex[:12]
-                now_ts = dbmod.now()
-                conn.execute(
-                    "INSERT INTO tasks (id, device_id, tenant, tool, args_json, tier, status, created_at, updated_at) VALUES (?,?,?,?,?,?,'queued',?,?)",
-                    (task_id, target_device_id, tenant, action, json.dumps(args), t_val, now_ts, now_ts),
-                )
-                conn.commit()
-                notify_tasks()
-                deadline = time.time() + 45.0
-                while time.time() < deadline:
-                    time.sleep(0.3)
-                    t_row = conn.execute("SELECT status, result FROM tasks WHERE id=?", (task_id,)).fetchone()
-                    if t_row and t_row["status"] in ("completed", "failed", "cancelled"):
-                        if t_row["status"] == "failed":
-                            raise RuntimeError(f"Remote device task failed: {t_row['result']}")
-                        try:
-                            return json.loads(t_row["result"])
-                        except Exception:
-                            return {"raw": t_row["result"]}
-                raise TimeoutError(f"Timed out waiting for device {target_device_id} to execute {action}.")
+            if dev_row is None:
+                raise HTTPException(status_code=404, detail="Device not found.")
+            if str(dev_row["tenant"] or "default") != tenant:
+                raise HTTPException(status_code=404, detail="Resource not found.")
+            tier = TOOL_TIERS.get(action)
+            t_val = tier.value if tier else 2
+            task_id = uuid.uuid4().hex[:12]
+            now_ts = dbmod.now()
+            conn.execute(
+                "INSERT INTO tasks (id, device_id, tenant, tool, args_json, tier, status, created_at, updated_at) VALUES (?,?,?,?,?,?,'queued',?,?)",
+                (task_id, target_device_id, tenant, action, json.dumps(args), t_val, now_ts, now_ts),
+            )
+            conn.commit()
+            notify_tasks()
+            deadline = time.time() + 45.0
+            while time.time() < deadline:
+                time.sleep(0.3)
+                t_row = conn.execute("SELECT status, result FROM tasks WHERE id=?", (task_id,)).fetchone()
+                if t_row and t_row["status"] in ("completed", "failed", "cancelled"):
+                    if t_row["status"] == "failed":
+                        raise RuntimeError(f"Remote device task failed: {t_row['result']}")
+                    try:
+                        return json.loads(t_row["result"])
+                    except Exception:
+                        return {"raw": t_row["result"]}
+            raise TimeoutError(f"Timed out waiting for device {target_device_id} to execute {action}.")
         raw_p = get_current_policy()
         eff_p = Policy(
             allow_writes=True,
@@ -2712,6 +2757,7 @@ def create_app(*, admin_token: str | None = None, db_path: Path | None = None, d
         row = conn.execute("SELECT * FROM workflows WHERE id=?", (workflow_id,)).fetchone()
         if row is None:
             raise HTTPException(status_code=404, detail="Workflow not found.")
+        require_tenant_access(str(row["tenant"]), x_admin_token, x_session_token)
 
         async def event_generator():
             last_step = -1
@@ -2962,6 +3008,7 @@ def create_app(*, admin_token: str | None = None, db_path: Path | None = None, d
         x_session_token: str | None = Header(default=None),
     ):
         actor = require_role("operator", x_admin_token, x_session_token)
+        require_tenant_access(body.tenant, x_admin_token, x_session_token)
         query = "SELECT * FROM devices WHERE revoked=0 AND tenant=?"
         params = [body.tenant]
         if body.target_os:
@@ -3016,7 +3063,14 @@ def create_app(*, admin_token: str | None = None, db_path: Path | None = None, d
         x_session_token: str | None = Header(default=None),
     ):
         require_role("viewer", x_admin_token, x_session_token)
-        task_rows = conn.execute("SELECT * FROM tasks WHERE id LIKE ?", (f"bcast-{batch_id}-%",)).fetchall()
+        assigned_tenant = current_user_tenant(x_admin_token, x_session_token)
+        if assigned_tenant is None:
+            task_rows = conn.execute("SELECT * FROM tasks WHERE id LIKE ?", (f"bcast-{batch_id}-%",)).fetchall()
+        else:
+            task_rows = conn.execute(
+                "SELECT * FROM tasks WHERE id LIKE ? AND tenant=?",
+                (f"bcast-{batch_id}-%", assigned_tenant),
+            ).fetchall()
         if not task_rows:
             raise HTTPException(status_code=404, detail="Broadcast batch not found.")
 
@@ -3086,6 +3140,8 @@ def create_app(*, admin_token: str | None = None, db_path: Path | None = None, d
     ):
         actor = require_role("admin", x_admin_token, x_session_token)
         require_tenant_access(body.tenant, x_admin_token, x_session_token)
+        if body.device_id and device_tenant(body.device_id) != body.tenant:
+            raise HTTPException(status_code=404, detail="Resource not found.")
         tid = uuid.uuid4().hex[:12]
         now_ts = dbmod.now()
         conn.execute(
@@ -3203,6 +3259,8 @@ def create_app(*, admin_token: str | None = None, db_path: Path | None = None, d
     ):
         actor = require_role("admin", x_admin_token, x_session_token)
         require_tenant_access(body.tenant, x_admin_token, x_session_token)
+        if body.device_id and device_tenant(body.device_id) != body.tenant:
+            raise HTTPException(status_code=404, detail="Resource not found.")
         sid = uuid.uuid4().hex[:12]
         now_ts = dbmod.now()
         interval = max(10, int(body.interval_seconds))
@@ -3338,7 +3396,7 @@ def create_app(*, admin_token: str | None = None, db_path: Path | None = None, d
                 "capture_desktop_frame",
                 {"scale": scale, "quality": quality},
                 device_id,
-                "default",
+                device_tenant(device_id),
                 "desktop_stream",
             )
             if isinstance(res, dict) and res.get("base64_data"):
@@ -3374,12 +3432,14 @@ def create_app(*, admin_token: str | None = None, db_path: Path | None = None, d
     @app.get("/api/fleet/desktop/frames")
     def get_fleet_desktop_frames(
         os: str | None = None,
+        tenant: str = "default",
         x_admin_token: str | None = Header(default=None),
         x_session_token: str | None = Header(default=None),
     ):
         require_role("viewer", x_admin_token, x_session_token)
-        query = "SELECT id, name, hostname, os, status, last_seen FROM devices WHERE revoked=0"
-        params = []
+        require_tenant_access(tenant, x_admin_token, x_session_token)
+        query = "SELECT id, name, hostname, os, status, last_seen FROM devices WHERE revoked=0 AND tenant=?"
+        params = [tenant]
         if os:
             query += " AND (LOWER(os) LIKE ? OR LOWER(name) LIKE ?)"
             params.extend([f"%{os.lower()}%", f"%{os.lower()}%"])
@@ -3427,7 +3487,7 @@ def create_app(*, admin_token: str | None = None, db_path: Path | None = None, d
                 "mouse_click",
                 {"x": abs_x, "y": abs_y, "button": btn, "clicks": clicks},
                 device_id,
-                "default",
+                device_tenant(device_id),
                 f"dual_control:{actor}",
             )
         elif action == "move":
@@ -3435,7 +3495,7 @@ def create_app(*, admin_token: str | None = None, db_path: Path | None = None, d
                 "mouse_move",
                 {"x": abs_x, "y": abs_y},
                 device_id,
-                "default",
+                device_tenant(device_id),
                 f"dual_control:{actor}",
             )
         elif action == "scroll":
@@ -3443,7 +3503,7 @@ def create_app(*, admin_token: str | None = None, db_path: Path | None = None, d
                 "mouse_scroll",
                 {"delta": body.delta, "x": abs_x, "y": abs_y},
                 device_id,
-                "default",
+                device_tenant(device_id),
                 f"dual_control:{actor}",
             )
         elif action == "type":
@@ -3451,7 +3511,7 @@ def create_app(*, admin_token: str | None = None, db_path: Path | None = None, d
                 "keyboard_type",
                 {"text": body.text or ""},
                 device_id,
-                "default",
+                device_tenant(device_id),
                 f"dual_control:{actor}",
             )
         elif action in ("press", "hotkey"):
@@ -3459,7 +3519,7 @@ def create_app(*, admin_token: str | None = None, db_path: Path | None = None, d
                 "press_hotkey",
                 {"combo": body.key or ""},
                 device_id,
-                "default",
+                device_tenant(device_id),
                 f"dual_control:{actor}",
             )
         else:
@@ -3494,6 +3554,7 @@ def create_app(*, admin_token: str | None = None, db_path: Path | None = None, d
         dev_row = conn.execute("SELECT * FROM devices WHERE id=? AND revoked=0", (device_id,)).fetchone()
         if dev_row is None:
             raise HTTPException(status_code=404, detail="Device not found.")
+        tenant = str(dev_row["tenant"] or "default")
         tier = TOOL_TIERS.get(tool)
         t_val = tier.value if tier else 3
         task_id = uuid.uuid4().hex[:12]
@@ -3503,7 +3564,7 @@ def create_app(*, admin_token: str | None = None, db_path: Path | None = None, d
             args["monitor_index"] = monitor_index
         conn.execute(
             "INSERT INTO tasks (id, device_id, tenant, tool, args_json, tier, status, created_at, updated_at) VALUES (?,?,?,?,?,?,'queued',?,?)",
-            (task_id, device_id, "default", tool,
+            (task_id, device_id, tenant, tool,
              json.dumps(args), t_val, now_ts, now_ts),
         )
         conn.commit()
@@ -3529,6 +3590,10 @@ def create_app(*, admin_token: str | None = None, db_path: Path | None = None, d
             mons = [{"index": 0, "name": "Primary Display", "width": 1920, "height": 1080, "is_primary": True}]
         return {"monitors": mons}
 
+    def require_webrtc_owner(session: dict, actor: str) -> None:
+        if session.get("user_id") != actor and actor != "admin-token":
+            raise HTTPException(status_code=404, detail="WebRTC session not found.")
+
     @app.post("/api/devices/{device_id}/desktop/webrtc/session")
     def create_webrtc_session(
         device_id: str,
@@ -3549,7 +3614,7 @@ def create_app(*, admin_token: str | None = None, db_path: Path | None = None, d
         session_id = uuid.uuid4().hex[:12]
         sess = {
             "id": session_id, "session_id": session_id, "device_id": device_id,
-            "user_id": actor, "mode": mode, "status": "waiting",
+            "user_id": actor, "tenant": device_tenant(device_id), "mode": mode, "status": "waiting",
             "video": {"codec": "H264", "width": int(1920 * scale) & ~1, "height": int(1080 * scale) & ~1, "fps": fps},
             "permissions": {"view_screen": True, "control_mouse": mode != "view_only", "control_keyboard": mode != "view_only", "execute_commands": False},
             "offer": None, "answer": None, "agent_candidates": [], "viewer_candidates": [],
@@ -3578,6 +3643,7 @@ def create_app(*, admin_token: str | None = None, db_path: Path | None = None, d
     ):
         require_role("viewer", x_admin_token, x_session_token)
         sess = _get_webrtc_session(device_id, session_id)
+        require_webrtc_owner(sess, require_role("viewer", x_admin_token, x_session_token))
         from ai_bridge import webrtc_stream
         out = {k: sess.get(k) for k in ("id", "session_id", "device_id", "user_id", "mode", "video", "permissions", "status", "offer", "answer", "agent_candidates", "viewer_candidates", "error", "scale", "fps", "monitor_index")}
         out["telemetry"] = webrtc_stream.get_session_telemetry(session_id)
@@ -3590,8 +3656,9 @@ def create_app(*, admin_token: str | None = None, db_path: Path | None = None, d
         x_admin_token: str | None = Header(default=None),
         x_session_token: str | None = Header(default=None),
     ):
-        require_role("viewer", x_admin_token, x_session_token)
+        actor = require_role("viewer", x_admin_token, x_session_token)
         sess = _get_webrtc_session(device_id, session_id)
+        require_webrtc_owner(sess, actor)
         sess["answer"] = {"sdp": body.get("sdp"), "type": body.get("type", "answer")}
         sess["status"] = "answered"
         _save_sess(sess)
@@ -3603,8 +3670,9 @@ def create_app(*, admin_token: str | None = None, db_path: Path | None = None, d
         x_admin_token: str | None = Header(default=None),
         x_session_token: str | None = Header(default=None),
     ):
-        require_role("viewer", x_admin_token, x_session_token)
+        actor = require_role("viewer", x_admin_token, x_session_token)
         sess = _get_webrtc_session(device_id, session_id)
+        require_webrtc_owner(sess, actor)
         if body.get("candidate"):
             sess.setdefault("viewer_candidates", []).append(body["candidate"])
             _save_sess(sess)
@@ -3616,8 +3684,9 @@ def create_app(*, admin_token: str | None = None, db_path: Path | None = None, d
         x_admin_token: str | None = Header(default=None),
         x_session_token: str | None = Header(default=None),
     ):
-        require_role("viewer", x_admin_token, x_session_token)
+        actor = require_role("viewer", x_admin_token, x_session_token)
         sess = _get_webrtc_session(device_id, session_id)
+        require_webrtc_owner(sess, actor)
         sess["status"] = "ended"
         _save_sess(sess)
         if device_id != "local":
