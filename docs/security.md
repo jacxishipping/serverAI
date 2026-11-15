@@ -63,3 +63,16 @@ Session permissions are derived **exclusively on the backend** (`src/ai_bridge/c
   separately. Database restores need the same key to recover those values.
 - Key rotation is not automatic. Re-encrypt every secret with the new key before
   removing the old key. A wrong key is detected during startup validation.
+
+## 7. Tenant Scoping
+
+- User accounts carry one tenant assignment; omitted or default tenant values
+  resolve to the authenticated user's tenant. Administrators retain
+  cross-tenant access.
+- Tenant-selected API reads and writes are scoped to that assignment. A shared
+  request guard covers device-ID routes, including desktop and terminal
+  operations. Workflow, schedule, trigger, broadcast, and agent-run paths also
+  check tenant ownership where they address records by ID.
+- These checks are implementation controls, not a certification. Run the
+  multi-tenant API security checks and review every new route before making a
+  production isolation claim.

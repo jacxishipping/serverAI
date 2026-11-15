@@ -33,9 +33,11 @@
 - Real terminal streaming, unattended desktop streaming, scheduling and workflow
   editors are not exposed by these operations panels; their existing previews
   remain explicitly separate from live operations.
-- Tier-4/device override semantics, tenant isolation and horizontal deployment
-  need a dedicated security review. Emergency-stop and single-use OIDC pending
-  state are database-backed and survive restart. Workers refresh emergency-stop
+- Tier-4/device override semantics and horizontal deployment need a dedicated
+  security review. User-to-tenant assignments and API tenant checks are
+  implemented, but multi-tenant API validation and security review remain open.
+  Emergency-stop and single-use OIDC pending state are database-backed and
+  survive restart. Workers refresh emergency-stop
   state from the database at most every 500 ms. This release is not a security
   certification.
 - The production container currently uses one API worker because background
