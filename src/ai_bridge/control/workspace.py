@@ -13,6 +13,7 @@ from . import db as dbmod
 class UserUpdate(BaseModel):
     role: Literal["viewer", "operator", "admin"]
     disabled: bool = False
+    tenant: str | None = Field(default=None, min_length=1, max_length=100)
 
 
 class DeviceMetadata(BaseModel):
@@ -20,7 +21,7 @@ class DeviceMetadata(BaseModel):
     tags: list[str] = Field(default_factory=list, max_length=10)
 
 
-def install_workspace_routes(app, conn, require_role, audit):
+def install_workspace_routes(app, conn, require_role, audit, require_tenant_access):
     @app.patch("/api/auth/users/{username}")
     def update_user(username: str, body: UserUpdate, x_admin_token: str | None = Header(default=None),
                     x_session_token: str | None = Header(default=None)):
@@ -40,7 +41,8 @@ def install_workspace_routes(app, conn, require_role, audit):
                 count = conn.execute("SELECT COUNT(*) AS n FROM users WHERE role='admin' AND disabled=0").fetchone()["n"]
                 if count <= 1:
                     raise HTTPException(409, "Keep at least one active administrator.")
-            conn.execute("UPDATE users SET role=?, disabled=? WHERE username=?", (body.role, int(body.disabled), username))
+            tenant = body.tenant if body.tenant is not None else user["tenant"]
+            conn.execute("UPDATE users SET role=?, disabled=?, tenant=? WHERE username=?", (body.role, int(body.disabled), tenant, username))
             conn.execute("DELETE FROM sessions WHERE username=?", (username,))
         audit(actor, "", "update_user", {"username": username, **body.model_dump()}, "allowed")
         return {"username": username, **body.model_dump(), "sessions_revoked": True}
@@ -71,6 +73,7 @@ def install_workspace_routes(app, conn, require_role, audit):
                   page_size: int = Query(default=25, ge=1, le=100),
                   x_admin_token: str | None = Header(default=None), x_session_token: str | None = Header(default=None)):
         require_role("viewer", x_admin_token, x_session_token)
+        require_tenant_access(tenant, x_admin_token, x_session_token)
         clauses, params = ["d.tenant=?"], [tenant]
         if q.strip():
             clauses.append("(LOWER(d.name) LIKE ? OR LOWER(d.hostname) LIKE ? OR LOWER(d.id) LIKE ?)")
@@ -106,6 +109,7 @@ def install_workspace_routes(app, conn, require_role, audit):
                      page_size: int = Query(default=25, ge=1, le=100),
                      x_admin_token: str | None = Header(default=None), x_session_token: str | None = Header(default=None)):
         require_role("viewer", x_admin_token, x_session_token)
+        require_tenant_access(tenant, x_admin_token, x_session_token)
         clauses, params = ["tenant=?"], [tenant]
         if status != "all":
             clauses.append("status=?")
@@ -126,6 +130,7 @@ def install_workspace_routes(app, conn, require_role, audit):
     def notifications(tenant: str = "default", x_admin_token: str | None = Header(default=None),
                       x_session_token: str | None = Header(default=None)):
         require_role("viewer", x_admin_token, x_session_token)
+        require_tenant_access(tenant, x_admin_token, x_session_token)
         offline = conn.execute("SELECT COUNT(*) AS n FROM devices WHERE tenant=? AND revoked=0 AND "
                                "(status!='online' OR last_seen IS NULL OR last_seen<?)",
                                (tenant, dbmod.now() - 120)).fetchone()["n"]

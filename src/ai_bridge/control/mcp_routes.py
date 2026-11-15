@@ -187,7 +187,7 @@ POPULAR_MCP_TEMPLATES = [
 ]
 
 
-def install_mcp_routes(app: Any, conn: Any, require_role: Any, audit: Any) -> None:
+def install_mcp_routes(app: Any, conn: Any, require_role: Any, audit: Any, require_tenant_access: Any) -> None:
     """Attach MCP Server management and automated OAuth2 routes."""
 
     @app.get("/api/mcp/templates")
@@ -205,6 +205,7 @@ def install_mcp_routes(app: Any, conn: Any, require_role: Any, audit: Any) -> No
         x_session_token: str | None = Header(default=None),
     ):
         require_role("viewer", x_admin_token, x_session_token)
+        require_tenant_access(tenant, x_admin_token, x_session_token)
         rows = conn.execute(
             "SELECT * FROM mcp_servers WHERE tenant=? ORDER BY created_at DESC", (tenant,)
         ).fetchall()
