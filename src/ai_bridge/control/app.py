@@ -2671,36 +2671,48 @@ def create_app(*, admin_token: str | None = None, db_path: Path | None = None, d
                 ).fetchall()
                 for job in due_jobs:
                     interval = max(10, int(job["interval_seconds"]))
-                    if not _claim_schedule_occurrence(conn, str(job["id"]), now_ts, interval):
-                        continue
-                    conn.commit()
                     tool_name = job["tool"]
                     try:
                         args = json.loads(job["args_json"] or "{}")
                     except Exception:
                         args = {}
                     target = job["device_id"]
+                    wf_id = None
                     try:
                         if tool_name == "__workflow__":
                             wf_steps = args.get("steps") or []
-                            if wf_steps and not emergency_stop_active():
-                                wf_id = uuid.uuid4().hex[:12]
-                                wf_name = str(args.get("name") or job["name"] or "Scheduled Workflow")
-                                conn.execute(
-                                    "INSERT INTO workflows (id, name, tenant, device_id, steps_json, status, current_step, total_steps, results_json, created_at, updated_at) "
-                                    "VALUES (?, ?, ?, ?, ?, 'running', 0, ?, '[]', ?, ?)",
-                                    (wf_id, wf_name, job["tenant"], target or "local", json.dumps(wf_steps), len(wf_steps), now_ts, now_ts),
-                                )
-                                conn.commit()
-                                threading.Thread(
-                                    target=_run_workflow_worker,
-                                    args=(wf_id, target or None, job["tenant"], wf_steps, bool(args.get("stop_on_failure", True)), int(args.get("max_retries", 1)), f"scheduler:{job['name']}"),
-                                    daemon=True,
-                                ).start()
+                            wf_name = str(args.get("name") or job["name"] or "Scheduled Workflow")
+                            stop_on_failure = bool(args.get("stop_on_failure", True))
+                            max_retries = max(0, int(args.get("max_retries", 1)))
                         else:
-                            _execute_workflow_step_sync(tool_name, args, target, job["tenant"], f"scheduler:{job['name']}")
+                            wf_steps = [{"name": job["name"], "action": tool_name, "args": args}]
+                            wf_name = str(job["name"] or f"Scheduled {tool_name}")
+                            stop_on_failure = True
+                            max_retries = 0
+
+                        if not wf_steps or emergency_stop_active():
+                            continue
+                        wf_id = uuid.uuid4().hex[:12]
+                        with conn.transaction():
+                            if not _claim_schedule_occurrence(conn, str(job["id"]), now_ts, interval):
+                                continue
+                            conn.execute(
+                                "INSERT INTO workflows (id, name, tenant, device_id, steps_json, status, current_step, total_steps, results_json, created_at, updated_at) "
+                                "VALUES (?, ?, ?, ?, ?, 'running', 0, ?, '[]', ?, ?)",
+                                (wf_id, wf_name, job["tenant"], target or "local", json.dumps(wf_steps), len(wf_steps), now_ts, now_ts),
+                            )
+                        threading.Thread(
+                            target=_run_workflow_worker,
+                            args=(wf_id, target or None, job["tenant"], wf_steps, stop_on_failure, max_retries, f"scheduler:{job['name']}"),
+                            daemon=True,
+                        ).start()
                     except Exception:
-                        pass
+                        if wf_id:
+                            conn.execute(
+                                "UPDATE workflows SET status='failed', error=?, completed_at=?, updated_at=? WHERE id=? AND status='running'",
+                                ("Scheduled workflow could not be started; inspect side effects before retrying.", dbmod.now(), dbmod.now(), wf_id),
+                            )
+                            conn.commit()
             except Exception:
                 time.sleep(5)
 
