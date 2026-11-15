@@ -2386,7 +2386,11 @@ def create_app(*, admin_token: str | None = None, db_path: Path | None = None, d
     @app.delete("/api/workflows/templates/{template_id}")
     def delete_workflow_template(template_id: str, x_admin_token: str | None = Header(default=None), x_session_token: str | None = Header(default=None)):
         actor = require_role("operator", x_admin_token, x_session_token)
-        cur = conn.execute("DELETE FROM workflow_templates WHERE id=?", (template_id,))
+        row = conn.execute("SELECT tenant FROM workflow_templates WHERE id=?", (template_id,)).fetchone()
+        if row is None:
+            raise HTTPException(status_code=404, detail="Custom template not found.")
+        require_tenant_access(str(row["tenant"]), x_admin_token, x_session_token)
+        cur = conn.execute("DELETE FROM workflow_templates WHERE id=? AND tenant=?", (template_id, row["tenant"]))
         conn.commit()
         if cur.rowcount == 0:
             raise HTTPException(status_code=404, detail="Custom template not found.")
