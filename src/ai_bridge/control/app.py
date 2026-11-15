@@ -941,10 +941,12 @@ def create_app(*, admin_token: str | None = None, db_path: Path | None = None, d
                     continue
                 seen.add(child_id)
                 now = dbmod.now()
-                conn.execute(
+                cur = conn.execute(
                     "UPDATE tasks SET status='failed', result=?, updated_at=? WHERE id=? AND status IN ('queued','needs_approval')",
                     (f"Dependency task {failed_dependency} ended with status {reason}.", now, child_id),
                 )
+                if cur.rowcount != 1:
+                    continue
                 conn.execute(
                     "UPDATE approvals SET status='denied', decided_by=?, decided_at=?, reason=? WHERE task_id=? AND status='pending'",
                     (actor, now, "Dependency task failed before this task could run.", child_id),
@@ -1639,18 +1641,31 @@ def create_app(*, admin_token: str | None = None, db_path: Path | None = None, d
 
     @app.post("/api/tasks/{task_id}/cancel")
     def cancel_task(task_id: str, x_admin_token: str | None = Header(default=None), x_session_token: str | None = Header(default=None)):
-        require_role("operator", x_admin_token, x_session_token)
+        actor = require_role("operator", x_admin_token, x_session_token)
         row = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
         if row is None:
             raise HTTPException(status_code=404, detail="Task not found.")
-        if row["status"] in {"completed", "failed", "cancelled"}:
+        if row["status"] in {"completed", "failed", "cancelled", "timed_out"}:
             return {"task_id": task_id, "status": row["status"]}
-        conn.execute("UPDATE tasks SET status='cancelled', updated_at=? WHERE id=?", (dbmod.now(), task_id))
-        record_task_event(task_id, str(row["tenant"]), "cancelled", "operator", {})
-        fail_waiting_dependents(task_id, str(row["tenant"]), "operator", "cancelled")
-        conn.commit()
+        now_ts = dbmod.now()
+        with conn.transaction():
+            cur = conn.execute(
+                "UPDATE tasks SET status='cancelled', updated_at=? WHERE id=? AND status IN ('queued','running','needs_approval')",
+                (now_ts, task_id),
+            )
+            if cur.rowcount != 1:
+                current = conn.execute("SELECT status FROM tasks WHERE id=?", (task_id,)).fetchone()
+                if current and current["status"] in {"completed", "failed", "cancelled", "timed_out"}:
+                    return {"task_id": task_id, "status": current["status"]}
+                raise HTTPException(status_code=409, detail="Task state changed; reload it before cancelling.")
+            conn.execute(
+                "UPDATE approvals SET status='denied', decided_by=?, decided_at=?, reason='Task cancelled' WHERE task_id=? AND status='pending'",
+                (actor, now_ts, task_id),
+            )
+            record_task_event(task_id, str(row["tenant"]), "cancelled", actor, {})
+            fail_waiting_dependents(task_id, str(row["tenant"]), actor, "cancelled")
         notify_tasks()
-        audit("admin", row["device_id"], "cancel_task", {"task_id": task_id}, "allowed")
+        audit(actor, row["device_id"], "cancel_task", {"task_id": task_id}, "allowed")
         return {"task_id": task_id, "status": "cancelled"}
 
     @app.put("/api/tasks/{task_id}")
@@ -1668,6 +1683,15 @@ def create_app(*, admin_token: str | None = None, db_path: Path | None = None, d
         valid_statuses = {"queued", "running", "needs_approval", "completed", "failed", "cancelled", "timed_out"}
         if status not in valid_statuses:
             raise HTTPException(status_code=400, detail=f"Invalid status: {status}")
+        original_status = str(row["status"])
+        if status != original_status and (status != "queued" or original_status not in {"failed", "cancelled", "timed_out"}):
+            raise HTTPException(
+                status_code=409,
+                detail="Tasks can only be re-queued from failed, cancelled, or timed-out states; use the approval and cancellation actions for other transitions.",
+            )
+        if payload_changed := ((tool != row["tool"]) or (args_json != row["args_json"])):
+            if original_status not in {"queued", "failed", "cancelled", "timed_out"}:
+                raise HTTPException(status_code=409, detail="Task tool and arguments cannot be changed after execution starts or approval is requested.")
         if status == "queued" and emergency_stop_active():
             raise HTTPException(status_code=403, detail="Emergency stop is active; cannot queue tasks.")
 
@@ -1679,7 +1703,6 @@ def create_app(*, admin_token: str | None = None, db_path: Path | None = None, d
             raise HTTPException(status_code=403, detail=f"Tool '{tool}' is not in the allowed tools list for this device.")
 
         needs_approval = tier_enum.value >= 4 or (tier_enum.value == 3 and not eff_policy.get("allow_tier3", False))
-        payload_changed = (tool != row["tool"]) or (args_json != row["args_json"])
         already_ran = row["status"] in {"running", "completed", "failed", "timed_out"}
         approval_id = row["approval_id"]
 
@@ -1698,15 +1721,29 @@ def create_app(*, admin_token: str | None = None, db_path: Path | None = None, d
             if ap["tool"] and ap["tool"] != tool:
                 raise HTTPException(status_code=409, detail="Task approval tool mismatch.")
 
+        now_ts = dbmod.now()
+        requeueing = status == "queued" and original_status in {"failed", "cancelled", "timed_out"}
+        previous_result = str(row["result"] or "") if requeueing else ""
         with conn.transaction():
-            conn.execute(
-                "UPDATE tasks SET tool=?, args_json=?, tier=?, status=?, approval_id=?, updated_at=? WHERE id=?",
-                (tool, args_json, tier_enum.value, status, approval_id, dbmod.now(), task_id),
+            cur = conn.execute(
+                "UPDATE tasks SET tool=?, args_json=?, tier=?, status=?, approval_id=?, result=CASE WHEN ? THEN '' ELSE result END, "
+                "checkpoint_json=CASE WHEN ? THEN '{}' ELSE checkpoint_json END, updated_at=? WHERE id=? AND status=?",
+                (tool, args_json, tier_enum.value, status, approval_id, requeueing, requeueing, now_ts, task_id, original_status),
             )
+            if cur.rowcount != 1:
+                raise HTTPException(status_code=409, detail="Task state changed; reload it before applying this update.")
             if status != row["status"] or payload_changed:
                 record_task_event(
                     task_id, str(row["tenant"]), "admin_updated", actor,
-                    {"from_status": row["status"], "to_status": status, "tool_changed": tool != row["tool"], "args_changed": args_json != row["args_json"]},
+                    {
+                        "from_status": original_status,
+                        "to_status": status,
+                        "tool_changed": tool != row["tool"],
+                        "args_changed": args_json != row["args_json"],
+                        "retry": requeueing,
+                        "previous_result_sha256": hashlib.sha256(previous_result.encode("utf-8")).hexdigest() if previous_result else None,
+                        "previous_result_bytes": len(previous_result.encode("utf-8")) if previous_result else 0,
+                    },
                 )
             if status in {"failed", "cancelled", "timed_out"} and status != row["status"]:
                 fail_waiting_dependents(task_id, str(row["tenant"]), actor, status)
@@ -1831,16 +1868,23 @@ def create_app(*, admin_token: str | None = None, db_path: Path | None = None, d
         now = dbmod.now()
         rows = conn.execute("SELECT id, task_id FROM approvals WHERE status='pending' AND expires_at IS NOT NULL AND expires_at<=?", (now,)).fetchall()
         for row in rows:
-            conn.execute("UPDATE approvals SET status='expired', decided_by='system', decided_at=? WHERE id=? AND status='pending'", (now, row["id"]))
-            if row["task_id"]:
-                task = conn.execute("SELECT tenant FROM tasks WHERE id=?", (row["task_id"],)).fetchone()
-                conn.execute("UPDATE tasks SET status='cancelled', updated_at=? WHERE id=? AND status='needs_approval'", (now, row["task_id"]))
-                if task:
-                    record_task_event(row["task_id"], str(task["tenant"]), "cancelled", "system", {"reason": "approval_expired"})
-                    fail_waiting_dependents(row["task_id"], str(task["tenant"]), "system", "approval_expired")
+            with conn.transaction():
+                cur = conn.execute(
+                    "UPDATE approvals SET status='expired', decided_by='system', decided_at=? WHERE id=? AND status='pending'",
+                    (now, row["id"]),
+                )
+                if cur.rowcount != 1:
+                    continue
+                if row["task_id"]:
+                    task = conn.execute("SELECT tenant FROM tasks WHERE id=? AND status='needs_approval'", (row["task_id"],)).fetchone()
+                    task_cur = conn.execute(
+                        "UPDATE tasks SET status='cancelled', updated_at=? WHERE id=? AND status='needs_approval'",
+                        (now, row["task_id"]),
+                    )
+                    if task and task_cur.rowcount == 1:
+                        record_task_event(row["task_id"], str(task["tenant"]), "cancelled", "system", {"reason": "approval_expired"})
+                        fail_waiting_dependents(row["task_id"], str(task["tenant"]), "system", "approval_expired")
             audit("system", "", "expire_approval", {"approval_id": row["id"]}, "expired")
-        if rows:
-            conn.commit()
 
     def approval_detail(row) -> dict:
         data = dict(row)
@@ -1868,16 +1912,27 @@ def create_app(*, admin_token: str | None = None, db_path: Path | None = None, d
             expire_pending_approvals()
             raise HTTPException(status_code=409, detail="Approval has expired.")
         now = dbmod.now()
-        conn.execute("UPDATE approvals SET status=?, decided_by=?, decided_at=? WHERE id=? AND status='pending'", (body.decision, actor, now, approval_id))
-        if row["task_id"]:
-            new_status = "queued" if body.decision == "approved" else "cancelled"
-            conn.execute("UPDATE tasks SET status=?, updated_at=? WHERE id=?", (new_status, now, row["task_id"]))
-            task = conn.execute("SELECT tenant FROM tasks WHERE id=?", (row["task_id"],)).fetchone()
-            if task:
+        new_status = "queued" if body.decision == "approved" else "cancelled"
+        with conn.transaction():
+            cur = conn.execute(
+                "UPDATE approvals SET status=?, decided_by=?, decided_at=? WHERE id=? AND status='pending'",
+                (body.decision, actor, now, approval_id),
+            )
+            if cur.rowcount != 1:
+                raise HTTPException(status_code=409, detail="Approval was already decided; reload it before continuing.")
+            if row["task_id"]:
+                task = conn.execute("SELECT tenant, status FROM tasks WHERE id=?", (row["task_id"],)).fetchone()
+                if task is None or task["status"] != "needs_approval":
+                    raise HTTPException(status_code=409, detail="The task is no longer awaiting approval.")
+                task_cur = conn.execute(
+                    "UPDATE tasks SET status=?, updated_at=? WHERE id=? AND status='needs_approval'",
+                    (new_status, now, row["task_id"]),
+                )
+                if task_cur.rowcount != 1:
+                    raise HTTPException(status_code=409, detail="Task state changed while deciding approval.")
                 record_task_event(row["task_id"], str(task["tenant"]), new_status, actor, {"approval_id": approval_id})
                 if new_status == "cancelled":
                     fail_waiting_dependents(row["task_id"], str(task["tenant"]), actor, "approval_denied")
-        conn.commit()
         notify_tasks()
         audit(actor, "", "decide_approval", {"approval_id": approval_id, "decision": body.decision, "reason": body.reason}, "allowed")
         return {"approval_id": approval_id, "status": body.decision, "decided_by": actor, "decided_at": now}
@@ -1893,14 +1948,25 @@ def create_app(*, admin_token: str | None = None, db_path: Path | None = None, d
             raise HTTPException(status_code=409, detail=f"Approval is already {row['status']}.")
         feedback = (body.reason or "").strip() or "Operator requested re-plan with non-destructive parameters."
         now = dbmod.now()
-        conn.execute("UPDATE approvals SET status='denied', decided_by=?, decided_at=?, reason=? WHERE id=? AND status='pending'", (actor, now, feedback, approval_id))
-        if row["task_id"]:
-            conn.execute("UPDATE tasks SET status='cancelled', updated_at=? WHERE id=? AND status='needs_approval'", (now, row["task_id"]))
-            task = conn.execute("SELECT tenant FROM tasks WHERE id=?", (row["task_id"],)).fetchone()
-            if task:
+        with conn.transaction():
+            cur = conn.execute(
+                "UPDATE approvals SET status='denied', decided_by=?, decided_at=?, reason=? WHERE id=? AND status='pending'",
+                (actor, now, feedback, approval_id),
+            )
+            if cur.rowcount != 1:
+                raise HTTPException(status_code=409, detail="Approval was already decided; reload it before replanning.")
+            if row["task_id"]:
+                task = conn.execute("SELECT tenant, status FROM tasks WHERE id=?", (row["task_id"],)).fetchone()
+                if task is None or task["status"] != "needs_approval":
+                    raise HTTPException(status_code=409, detail="The task is no longer awaiting approval.")
+                task_cur = conn.execute(
+                    "UPDATE tasks SET status='cancelled', updated_at=? WHERE id=? AND status='needs_approval'",
+                    (now, row["task_id"]),
+                )
+                if task_cur.rowcount != 1:
+                    raise HTTPException(status_code=409, detail="Task state changed while replanning approval.")
                 record_task_event(row["task_id"], str(task["tenant"]), "cancelled", actor, {"reason": "approval_replanned"})
                 fail_waiting_dependents(row["task_id"], str(task["tenant"]), actor, "approval_replanned")
-        conn.commit()
         notify_tasks()
         audit(actor, "", "replan_approval", {"approval_id": approval_id, "feedback": feedback}, "denied")
         return {"approval_id": approval_id, "status": "denied", "feedback": feedback, "decided_by": actor, "decided_at": now}
@@ -2009,11 +2075,27 @@ def create_app(*, admin_token: str | None = None, db_path: Path | None = None, d
                 status_code=410,
             )
 
-        conn.execute("UPDATE approvals SET status=?, decided_by=?, decided_at=? WHERE id=? AND status='pending'", (decision, "mobile_quick_approval", now, approval_id))
-        if row["task_id"]:
-            new_status = "queued" if decision == "approved" else "cancelled"
-            conn.execute("UPDATE tasks SET status=?, updated_at=? WHERE id=?", (new_status, now, row["task_id"]))
-        conn.commit()
+        new_status = "queued" if decision == "approved" else "cancelled"
+        with conn.transaction():
+            cur = conn.execute(
+                "UPDATE approvals SET status=?, decided_by=?, decided_at=? WHERE id=? AND status='pending'",
+                (decision, "mobile_quick_approval", now, approval_id),
+            )
+            if cur.rowcount != 1:
+                raise HTTPException(status_code=409, detail="Approval was already decided; reload it before continuing.")
+            if row["task_id"]:
+                task = conn.execute("SELECT tenant, status FROM tasks WHERE id=?", (row["task_id"],)).fetchone()
+                if task is None or task["status"] != "needs_approval":
+                    raise HTTPException(status_code=409, detail="The task is no longer awaiting approval.")
+                task_cur = conn.execute(
+                    "UPDATE tasks SET status=?, updated_at=? WHERE id=? AND status='needs_approval'",
+                    (new_status, now, row["task_id"]),
+                )
+                if task_cur.rowcount != 1:
+                    raise HTTPException(status_code=409, detail="Task state changed while deciding approval.")
+                record_task_event(row["task_id"], str(task["tenant"]), new_status, "mobile_quick_approval", {"approval_id": approval_id})
+                if new_status == "cancelled":
+                    fail_waiting_dependents(row["task_id"], str(task["tenant"]), "mobile_quick_approval", "approval_denied")
         notify_tasks()
         audit("mobile_quick_approval", "", "decide_approval", {"approval_id": approval_id, "decision": decision, "channel": "mobile_hmac"}, "allowed")
 
@@ -2078,12 +2160,20 @@ def create_app(*, admin_token: str | None = None, db_path: Path | None = None, d
         row = conn.execute("SELECT task_id, status FROM approvals WHERE id=?", (approval_id,)).fetchone()
         if row is None:
             raise HTTPException(status_code=404, detail="Approval not found.")
-        if row["task_id"] and row["status"] == "pending":
-            conn.execute("UPDATE tasks SET status='cancelled', updated_at=? WHERE id=? AND status='needs_approval'", (dbmod.now(), row["task_id"]))
-        cur = conn.execute("DELETE FROM approvals WHERE id=?", (approval_id,))
-        conn.commit()
-        if cur.rowcount == 0:
-            raise HTTPException(status_code=404, detail="Approval not found.")
+        now_ts = dbmod.now()
+        with conn.transaction():
+            if row["task_id"] and row["status"] == "pending":
+                task = conn.execute("SELECT tenant FROM tasks WHERE id=? AND status='needs_approval'", (row["task_id"],)).fetchone()
+                task_cur = conn.execute(
+                    "UPDATE tasks SET status='cancelled', updated_at=? WHERE id=? AND status='needs_approval'",
+                    (now_ts, row["task_id"]),
+                )
+                if task and task_cur.rowcount == 1:
+                    record_task_event(row["task_id"], str(task["tenant"]), "cancelled", actor, {"reason": "approval_deleted"})
+                    fail_waiting_dependents(row["task_id"], str(task["tenant"]), actor, "approval_deleted")
+            cur = conn.execute("DELETE FROM approvals WHERE id=? AND status=?", (approval_id, row["status"]))
+            if cur.rowcount != 1:
+                raise HTTPException(status_code=409, detail="Approval state changed; reload it before deleting.")
         audit(actor, "", "delete_approval", {"approval_id": approval_id}, "allowed")
         return {"approval_id": approval_id, "deleted": True}
 

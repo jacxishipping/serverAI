@@ -36,7 +36,8 @@ that platform path has been exercised or production-ready.
   reconciliation are implemented. Interrupted running tasks, workflows and
   custom-agent runs are marked failed for operator review rather than replayed;
   scheduled occurrences and trigger cooldowns are committed atomically with
-  durable run/task records. Project memory APIs record source,
+  durable run/task records. Task transitions and retries are constrained by the
+  lifecycle contract in `task-lifecycle.md`. Project memory APIs record source,
   optional same-tenant task evidence and expiry; custom agents with a matching
   project ID load bounded, unexpired entries into their system context.
 - Heartbeats persist a bounded device capability list and inventory object. The

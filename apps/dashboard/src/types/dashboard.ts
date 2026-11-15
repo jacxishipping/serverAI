@@ -75,13 +75,15 @@ export interface EnrolledDevice {
 
 export type TaskRiskTier = "tier1_safe" | "tier2_workspace" | "tier3_shell" | "tier4_kernel";
 export type TaskStatus =
+  | "queued"
   | "pending"
   | "running"
   | "completed"
   | "failed"
   | "needs_approval"
   | "denied"
-  | "cancelled";
+  | "cancelled"
+  | "timed_out";
 
 export interface TaskInvocation {
   id: string;

@@ -841,6 +841,8 @@ export const TaskQueueVisionView: React.FC = () => {
                       {pagedTasks.map((t) => {
                         const isSelected = selectedTaskId === t.id;
                         const canCancel = t.status === "pending" || t.status === "running" || t.status === "needs_approval" || (t.status as string) === "queued";
+                        const canRetry = t.status === "failed" || t.status === "cancelled" || t.status === "timed_out";
+                        const canEdit = t.status === "queued" || t.status === "failed" || t.status === "cancelled" || t.status === "timed_out";
                         return (
                           <tr
                             key={t.id}
@@ -896,24 +898,26 @@ export const TaskQueueVisionView: React.FC = () => {
                                     <Ban className="w-3.5 h-3.5" />
                                   </button>
                                 )}
-                                {(t.status === "failed" || t.status === "cancelled" || t.status === "completed") && (
+                                {canRetry && (
                                   <button
                                     type="button"
                                     onClick={(e) => void handleRetryTask(t, e)}
-                                    title="Retry / Re-queue task"
+                                    title="Re-queue task after reviewing its prior result"
                                     className="p-1.5 rounded-lg bg-indigo-500/10 border border-indigo-500/30 text-indigo-300 hover:bg-indigo-500/20"
                                   >
                                     <RotateCcw className="w-3.5 h-3.5" />
                                   </button>
                                 )}
-                                <button
-                                  type="button"
-                                  onClick={(e) => openEditTask(t, e)}
-                                  title="Edit task tool/args"
-                                  className="p-1.5 rounded-lg bg-[var(--product-raised)] border border-[var(--product-line)] text-[var(--product-text-secondary)] hover:text-[var(--product-text)]"
-                                >
-                                  <Pencil className="w-3.5 h-3.5" />
-                                </button>
+                                {canEdit && (
+                                  <button
+                                    type="button"
+                                    onClick={(e) => openEditTask(t, e)}
+                                    title="Edit task tool/args"
+                                    className="p-1.5 rounded-lg bg-[var(--product-raised)] border border-[var(--product-line)] text-[var(--product-text-secondary)] hover:text-[var(--product-text)]"
+                                  >
+                                    <Pencil className="w-3.5 h-3.5" />
+                                  </button>
+                                )}
                                 <button
                                   type="button"
                                   onClick={(e) => void handleDeleteTask(t.id, e)}
