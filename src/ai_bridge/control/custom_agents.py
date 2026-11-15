@@ -742,12 +742,32 @@ class AgentRunner:
 
     def start(self) -> "AgentRunner":
         if self._thread is None:
+            self._reconcile_interrupted_runs()
             self._thread = threading.Thread(target=self._loop, name="custom-agent-runner", daemon=True)
             self._thread.start()
         return self
 
     def stop(self) -> None:
         self._stop.set()
+
+    def _reconcile_interrupted_runs(self) -> None:
+        """Mark runs abandoned by a process restart for operator review."""
+        now = _now()
+        reason = "Interrupted by control-plane restart; inspect tool effects before retrying."
+        with self._conn.transaction():
+            rows = self._conn.execute(
+                "SELECT id, agent_id, started_at FROM agent_runs WHERE status='running'"
+            ).fetchall()
+            for row in rows:
+                started = float(row["started_at"] or now)
+                self._conn.execute(
+                    "UPDATE agent_runs SET status='failed', finished_at=?, duration_ms=?, error=? WHERE id=? AND status='running'",
+                    (now, max(0, int((now - started) * 1000)), reason, row["id"]),
+                )
+                self._conn.execute(
+                    "UPDATE custom_agents SET status='error', last_error=?, updated_at=? WHERE id=? AND status='running'",
+                    (reason, now, row["agent_id"]),
+                )
 
     def _loop(self) -> None:
         while not self._stop.wait(RUNNER_TICK_S):
@@ -767,27 +787,53 @@ class AgentRunner:
                             continue
                         self._running.add(agent["id"])
                     interval = min(MAX_INTERVAL_S, max(MIN_INTERVAL_S, int(agent.get("interval_seconds") or DEFAULT_INTERVAL_S)))
-                    if not _claim_agent_run(self._conn, str(agent["id"]), now, interval):
+                    run_id = uuid.uuid4().hex[:16]
+                    started = _now()
+                    try:
+                        with self._conn.transaction():
+                            if not _claim_agent_run(self._conn, str(agent["id"]), now, interval):
+                                claimed = False
+                            else:
+                                claimed = True
+                                self._conn.execute(
+                                    "INSERT INTO agent_runs (id, agent_id, tenant, status, started_at) VALUES (?,?,?,'running',?)",
+                                    (run_id, agent["id"], str(agent.get("tenant") or "default"), started),
+                                )
+                    except Exception:
+                        with self._lock:
+                            self._running.discard(agent["id"])
+                        raise
+                    if not claimed:
                         with self._lock:
                             self._running.discard(agent["id"])
                         continue
-                    self._conn.commit()
-                    threading.Thread(
-                        target=self._run_one, args=(agent,), name=f"agent-run-{agent['id']}", daemon=True
-                    ).start()
+                    try:
+                        threading.Thread(
+                            target=self._run_one,
+                            args=(agent, run_id, started),
+                            name=f"agent-run-{agent['id']}",
+                            daemon=True,
+                        ).start()
+                    except Exception:
+                        finished = _now()
+                        reason = "Custom-agent worker could not be started; inspect before retrying."
+                        with self._conn.transaction():
+                            self._conn.execute(
+                                "UPDATE agent_runs SET status='failed', finished_at=?, duration_ms=?, error=? WHERE id=? AND status='running'",
+                                (finished, max(0, int((finished - started) * 1000)), reason, run_id),
+                            )
+                            self._conn.execute(
+                                "UPDATE custom_agents SET status='error', last_error=?, updated_at=? WHERE id=? AND status='running'",
+                                (reason, finished, agent["id"]),
+                            )
+                        with self._lock:
+                            self._running.discard(agent["id"])
             except Exception:  # noqa: BLE001 - the runner must survive transient DB errors
                 time.sleep(1)
 
-    def _run_one(self, agent: dict[str, Any]) -> None:
+    def _run_one(self, agent: dict[str, Any], run_id: str, started: float) -> None:
         agent_id = str(agent["id"])
-        run_id = uuid.uuid4().hex[:16]
-        started = _now()
         tenant = str(agent.get("tenant") or "default")
-        self._conn.execute(
-            "INSERT INTO agent_runs (id, agent_id, tenant, status, started_at) VALUES (?,?,?,'running',?)",
-            (run_id, agent_id, tenant, started),
-        )
-        self._conn.commit()
         try:
             fresh = self._conn.execute("SELECT * FROM custom_agents WHERE id=?", (agent_id,)).fetchone()
             if not fresh:
