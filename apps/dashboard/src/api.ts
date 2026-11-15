@@ -116,8 +116,8 @@ export const api = {
   submitTask: (device_id: string, tool: string, args: any = {}, tenant?: string, requestKey = crypto.randomUUID()) =>
     call("/api/tasks", "POST", { device_id, tool, args, tenant }, { "Idempotency-Key": requestKey }),
   users: () => call("/api/auth/users"),
-  createUser: (body: { username: string; password: string; role: string }) => call("/api/auth/users", "POST", body),
-  updateUser: (username: string, body: { role: string; disabled: boolean }) =>
+  createUser: (body: { username: string; password: string; role: string; tenant: string }) => call("/api/auth/users", "POST", body),
+  updateUser: (username: string, body: { role: string; disabled: boolean; tenant: string }) =>
     call(`/api/auth/users/${encodeURIComponent(username)}`, "PATCH", body),
   deviceMetadata: (id: string, body: { group: string; tags: string[] }) =>
     call(`/api/devices/${encodeURIComponent(id)}/metadata`, "PUT", body),

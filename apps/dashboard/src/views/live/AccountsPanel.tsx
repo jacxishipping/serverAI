@@ -3,7 +3,7 @@ import { api } from "../../api";
 import { GlassModal, JXButton } from "../../ui";
 import { Field, fieldClass, message, ReadState, useRead } from "./shared";
 
-interface Account { username: string; role: string; disabled: boolean }
+interface Account { username: string; role: string; tenant: string; disabled: boolean }
 export function AccountsPanel({ admin }: { admin: boolean }) {
   const load = useCallback(() => admin ? api.users() as Promise<Account[]> : Promise.resolve([]), [admin]);
   const state = useRead(load);
@@ -16,21 +16,21 @@ export function AccountsPanel({ admin }: { admin: boolean }) {
   return <section aria-label="Live users" className="space-y-4">
     <div className="flex flex-wrap gap-2">
       <JXButton color="neutral" variant="outlined" disabled={state.loading} onClick={state.refresh}>Refresh users</JXButton>
-      <JXButton disabled={state.loading || !!state.error} onClick={() => { setCreating(true); setEdit({ username: "", role: "viewer", disabled: false }); setPassword(""); setError(""); }}>Add user</JXButton>
+      <JXButton disabled={state.loading || !!state.error} onClick={() => { setCreating(true); setEdit({ username: "", role: "viewer", tenant: "default", disabled: false }); setPassword(""); setError(""); }}>Add user</JXButton>
     </div>
     <ReadState {...state} />
     <p className="text-xs text-[var(--product-text-tertiary)]">Google users appear after their first sign-in as viewers. Role or access changes revoke their existing sessions.</p>
     <ul className="divide-y divide-slate-800">{state.data?.map(user => <li key={user.username} className="flex flex-wrap items-center justify-between gap-3 py-3 text-sm">
       <span className="min-w-0 break-all" dir="auto">{user.username}</span>
-      <span className="text-xs text-[var(--product-text-tertiary)]">{user.role} · {user.disabled ? "Disabled" : "Active"}</span>
+      <span className="text-xs text-[var(--product-text-tertiary)]">{user.role} · {user.tenant || "default"} · {user.disabled ? "Disabled" : "Active"}</span>
       <JXButton color="neutral" variant="text" disabled={state.loading || !!state.error} onClick={() => { setCreating(false); setEdit({ ...user }); setError(""); }}>Edit {user.username}</JXButton>
     </li>)}</ul>
     {edit && <GlassModal title={creating ? "Add user" : "Review account access"} onClose={() => { if (!busy) { setEdit(undefined); setPassword(""); } }}>
       <form className="space-y-4" onSubmit={async event => {
         event.preventDefault(); if (busy || error) return; setBusy(true);
         try {
-          if (creating) await api.createUser({ username: edit.username.trim(), password, role: edit.role });
-          else await api.updateUser(edit.username, { role: edit.role, disabled: !!edit.disabled });
+          if (creating) await api.createUser({ username: edit.username.trim(), password, role: edit.role, tenant: edit.tenant.trim() || "default" });
+          else await api.updateUser(edit.username, { role: edit.role, disabled: !!edit.disabled, tenant: edit.tenant.trim() || "default" });
           setEdit(undefined); setPassword(""); void state.refresh();
         } catch (err) { setError(message(err)); }
         finally { setBusy(false); }
@@ -42,6 +42,7 @@ export function AccountsPanel({ admin }: { admin: boolean }) {
         <Field label="Account role"><select className={fieldClass} value={edit.role} onChange={e => setEdit({ ...edit, role: e.target.value })}>
           {["viewer", "operator", "admin"].map(role => <option key={role}>{role}</option>)}
         </select></Field>
+        <Field label="Tenant"><input className={fieldClass} required maxLength={100} value={edit.tenant || "default"} onChange={e => setEdit({ ...edit, tenant: e.target.value })} autoComplete="off" /></Field>
         {!creating && <label className="flex items-center gap-2 text-sm"><input type="checkbox" checked={!!edit.disabled} onChange={e => setEdit({ ...edit, disabled: e.target.checked })} />Disable account</label>}
         <p className="text-sm text-amber-300">Administrators can change policy, users and fleet safety. Operators can submit tasks. Viewers have read-only access.</p>
         {error && <p role="alert" className="text-sm text-amber-300">{error} Close this dialog and refresh users before trying again.</p>}
