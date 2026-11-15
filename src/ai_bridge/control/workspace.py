@@ -44,8 +44,8 @@ def install_workspace_routes(app, conn, require_role, audit, require_tenant_acce
             tenant = body.tenant if body.tenant is not None else user["tenant"]
             conn.execute("UPDATE users SET role=?, disabled=?, tenant=? WHERE username=?", (body.role, int(body.disabled), tenant, username))
             conn.execute("DELETE FROM sessions WHERE username=?", (username,))
-        audit(actor, "", "update_user", {"username": username, **body.model_dump()}, "allowed")
-        return {"username": username, **body.model_dump(), "sessions_revoked": True}
+        audit(actor, "", "update_user", {"username": username, **body.model_dump(), "tenant": tenant}, "allowed", tenant=tenant)
+        return {"username": username, **body.model_dump(), "tenant": tenant, "sessions_revoked": True}
 
     @app.put("/api/devices/{device_id}/metadata")
     def set_metadata(device_id: str, body: DeviceMetadata, x_admin_token: str | None = Header(default=None),
